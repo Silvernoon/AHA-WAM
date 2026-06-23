@@ -100,10 +100,11 @@ Set up the Python environment with:
 ```bash
 conda create -n ahawam python=3.10 -y
 conda activate ahawam
-pip install -U pip
+pip install -U pip setuptools wheel
 pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 \
   --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e .
+conda install -c conda-forge ffmpeg -y
 ```
 
 If you use the shell launchers, make sure `accelerate` and `deepspeed` are

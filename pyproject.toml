@@ -5,14 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ahawam"
 version = "0.1.0"
-description = "AHAWAM: standalone Wan2.2-TI2V-5B training/inference package"
-requires-python = ">=3.10"
+description = "AHA-WAM: standalone Wan2.2-TI2V-5B training and inference package"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
 dependencies = [
   "accelerate==1.12.0",
   "av==16.0.1",
   "boto3==1.35.99",
   "datasets==3.6.0",
-  "deepspeed>=0.18.7",
+  "deepspeed==0.18.7",
   "einops==0.8.1",
   "gitpython==3.1.45",
   "huggingface-hub==0.29.2",
@@ -31,13 +32,13 @@ dependencies = [
   "rich==14.2.0",
   "safetensors==0.5.3",
   "termcolor==2.5.0",
-  "torch==2.7.1+cu128",
+  "torch==2.7.1",
+  "torchvision==0.22.1",
   "torchcodec==0.5",
-  "torchvision==0.22.1+cu128",
   "tqdm==4.66.5",
   "transformers==4.49.0",
   "typing-extensions==4.15.0",
-  "wandb==0.23.1",
+  "wandb",
 ]
 
 [tool.setuptools.package-dir]
