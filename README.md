@@ -499,6 +499,17 @@ control path.
 The paper also reports **78.3%** average success across four real-world
 manipulation tasks.
 
+<a id="acknowledgements"></a>
+
+## 🙏 Acknowledgements
+
+We gratefully acknowledge the open-source contributions of
+[FastWAM](https://github.com/yuantianyuan01/FastWAM) and
+[RoboTwin](https://github.com/robotwin-Platform/robotwin). AHA-WAM benefits from
+their released code, benchmark environments, data processing pipelines, and
+evaluation infrastructure. We sincerely thank the authors and contributors for
+making these resources publicly available.
+
 <a id="citation"></a>
 
 ## 📌 Citation
