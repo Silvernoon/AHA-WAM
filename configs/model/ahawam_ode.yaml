@@ -1,0 +1,157 @@
+_target_: ahawam.runtime.create_ahawam_ode
+teacher_task_name: robotwin_uncond
+student_task_name: robotwin_uncond
+mot_checkpoint_mixed_attn: false
+action_horizon: 64
+action_chunk_size: 16
+action_train_timestep_mode: per_chunk
+student_capture_timestep_mode: per_chunk
+teacher_num_inference_steps: 16
+teacher_capture_step_indices: [0, 1, 2, 4, 8, 12, 16]
+teacher_sigma_shift: null
+num_history_frames: 6
+
+teacher:
+  _target_: ahawam.runtime.create_ahawam_teacher
+  checkpoint_path: null
+  model:
+    _target_: ahawam.runtime.create_ahawam
+    model_id: Wan-AI/Wan2.2-TI2V-5B
+    tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+    tokenizer_max_len: 128
+    load_text_encoder: false
+    proprio_dim: ${data.train.processor.proprio_output_dim}
+    redirect_common_files: true
+    mot_checkpoint_mixed_attn: ${model.mot_checkpoint_mixed_attn}
+    action_dit_pretrained_path: null
+    skip_dit_load_from_pretrain: true
+    action_horizon: ${model.action_horizon}
+    action_chunk_size: ${model.action_chunk_size}
+    action_train_timestep_mode: ${model.action_train_timestep_mode}
+    action_obs_downsample_factor: 1
+    chunk_kv_editor_num_queries: 32
+    num_history_frames: ${model.num_history_frames}
+    action_video_read_mode: current_only
+    video_rope_frame_stride: ${data.train.action_video_freq_ratio}
+    checkpoint_shape_adapt: true
+    video_dit_config:
+      has_image_input: false
+      patch_size: [1, 2, 2]
+      in_dim: 48
+      hidden_dim: 3072
+      ffn_dim: 14336
+      freq_dim: 256
+      text_dim: 4096
+      out_dim: 48
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      eps: 1.0e-06
+      seperated_timestep: true
+      require_clip_embedding: false
+      require_vae_embedding: false
+      fuse_vae_embedding_in_latents: true
+      use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+      video_attention_mask_mode: "per_frame_causal"
+      action_conditioned: false
+      action_dim: ${data.train.processor.action_output_dim}
+      action_group_causal_mask_mode: "group_diagonal"
+    action_dit_config:
+      action_dim: ${data.train.processor.action_output_dim}
+      hidden_dim: 1024
+      ffn_dim: 4096
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      text_dim: 4096
+      freq_dim: 256
+      eps: 1.0e-06
+      autoregressive_teacher_forcing: true
+      action_chunk_size: ${model.action_chunk_size}
+      action_teacher_forcing_mask_mode: "stage1_chunkwise"
+      use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+    video_scheduler:
+      train_shift: 5.0
+      infer_shift: 5.0
+      num_train_timesteps: 1000
+    action_scheduler:
+      train_shift: 5.0
+      infer_shift: 5.0
+      num_train_timesteps: 1000
+    loss:
+      lambda_action: 1.0
+      lambda_action_prior: 1.0
+
+student:
+  _target_: ahawam.runtime.create_ahawam_student
+  checkpoint_path: null
+  prediction_type: flow
+  ode_denoise_step_indices: [0, 1, 2, 4, 8, 12, 16]
+  default_action_inference_steps: 1
+  model:
+    _target_: ahawam.runtime.create_ahawam
+    model_id: Wan-AI/Wan2.2-TI2V-5B
+    tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+    tokenizer_max_len: 128
+    load_text_encoder: false
+    proprio_dim: ${data.train.processor.proprio_output_dim}
+    redirect_common_files: true
+    mot_checkpoint_mixed_attn: ${model.mot_checkpoint_mixed_attn}
+    action_dit_pretrained_path: null
+    skip_dit_load_from_pretrain: true
+    action_horizon: ${model.action_horizon}
+    action_chunk_size: ${model.action_chunk_size}
+    action_train_timestep_mode: ${model.action_train_timestep_mode}
+    action_obs_downsample_factor: 1
+    chunk_kv_editor_num_queries: 32
+    num_history_frames: ${model.num_history_frames}
+    action_video_read_mode: current_only
+    video_rope_frame_stride: ${data.train.action_video_freq_ratio}
+    checkpoint_shape_adapt: true
+    video_dit_config:
+      has_image_input: false
+      patch_size: [1, 2, 2]
+      in_dim: 48
+      hidden_dim: 3072
+      ffn_dim: 14336
+      freq_dim: 256
+      text_dim: 4096
+      out_dim: 48
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      eps: 1.0e-06
+      seperated_timestep: true
+      require_clip_embedding: false
+      require_vae_embedding: false
+      fuse_vae_embedding_in_latents: true
+      use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+      video_attention_mask_mode: "per_frame_causal"
+      action_conditioned: false
+      action_dim: ${data.train.processor.action_output_dim}
+      action_group_causal_mask_mode: "group_diagonal"
+    action_dit_config:
+      action_dim: ${data.train.processor.action_output_dim}
+      hidden_dim: 1024
+      ffn_dim: 4096
+      num_heads: 24
+      attn_head_dim: 128
+      num_layers: 30
+      text_dim: 4096
+      freq_dim: 256
+      eps: 1.0e-06
+      autoregressive_teacher_forcing: true
+      action_chunk_size: ${model.action_chunk_size}
+      action_teacher_forcing_mask_mode: "stage1_chunkwise"
+      use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+    video_scheduler:
+      train_shift: 5.0
+      infer_shift: 5.0
+      num_train_timesteps: 1000
+    action_scheduler:
+      train_shift: 5.0
+      infer_shift: 5.0
+      num_train_timesteps: 1000
+    loss:
+      lambda_action: 1.0
+      lambda_action_prior: 1.0

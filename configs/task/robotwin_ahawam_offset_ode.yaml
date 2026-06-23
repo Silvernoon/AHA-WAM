@@ -1,0 +1,66 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin
+  - override /model: ahawam_ode
+  - _self_
+
+batch_size: 16
+num_workers: 16
+history_aware_batching: true
+
+model:
+  mot_checkpoint_mixed_attn: false
+  action_horizon: 80
+  action_chunk_size: 16
+  max_action_offset: 15
+  teacher:
+    checkpoint_path: path/to/step_045000.pt
+    model:
+      max_action_offset: ${model.max_action_offset}
+  student:
+    checkpoint_path: null
+    model:
+      max_action_offset: ${model.max_action_offset}
+
+data:
+  train:
+    dataset_dirs:
+      - path/to/robotwin2.0
+    pretrained_norm_stats: path/to/dataset_stats.json
+    text_embedding_cache_dir: path/to/text_embeds_cache/robotwin
+    num_frames: 97
+    max_action_offset: ${model.max_action_offset}
+    action_chunk_size: ${model.action_chunk_size}
+    action_horizon: ${model.action_horizon}
+  val:
+    dataset_dirs:
+      - path/to/robotwin2.0
+    pretrained_norm_stats: path/to/dataset_stats.json
+    text_embedding_cache_dir: path/to/text_embeds_cache/robotwin
+    num_frames: 97
+    max_action_offset: ${model.max_action_offset}
+    action_chunk_size: ${model.action_chunk_size}
+    action_horizon: ${model.action_horizon}
+
+output_dir: path/to/checkpoints/robotwin_offset_ode/runs/train/${hydra:runtime.choices.task}-${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+wandb:
+  enabled: true
+  workspace: null
+  project: ahawam
+  name: robotwin_ahawam_offset_ode
+  group: null
+  mode: online
+
+lr_scheduler_type: "cosine"
+learning_rate: 2e-5
+num_epochs: 5
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 500
+
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null
