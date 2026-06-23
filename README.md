@@ -333,7 +333,7 @@ robotwin_ahawam_offset_ode
 Examples:
 
 ```bash
-# Prior-only AHA-WAM training
+# AHA-WAM training
 bash scripts/train_zero1.sh 8 task=robotwin_ahawam
 
 # Offset-aware AHA-WAM training
