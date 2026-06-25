@@ -4,11 +4,7 @@
 
 This node runs on the robot computer. It subscribes to ROS observations,
 sends plain Python/NumPy data to the policy server, then publishes the
-returned 14-D action chunk to /master/joint_left and /master/joint_right.
-
-With `roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=true`, those
-/master/joint_* topics are the command inputs consumed by the Piper ROS node to
-control the physical puppet arms.
+returned 14-D action chunk to the configured robot command topics.
 """
 
 import argparse
@@ -207,8 +203,7 @@ class RosOperator:
                 tcp_nodelay=True,
             )
 
-        # In Piper mode=1 these /master/joint_* topics are command topics for
-        # the physical puppet arms.
+        # The configured command topics receive the left/right arm actions.
         self.left_cmd_pub = rospy.Publisher(self.args.cmd_left_topic, JointState, queue_size=10)
         self.right_cmd_pub = rospy.Publisher(self.args.cmd_right_topic, JointState, queue_size=10)
 
@@ -637,10 +632,10 @@ def run(args):
                 "effort": frame["effort"],
                 "base_vel": frame["base_vel"],
                 "images": {"front": frame["front"]},
-            } # 4060 向 4090发送的机械臂信息
+            }
 
             t0 = time.perf_counter()
-            reply = client.request(request) # reply: 4090返回的动作信息
+            reply = client.request(request)
             round_trip_ms = (time.perf_counter() - t0) * 1000.0
             if not reply.get("ok", False):
                 raise RuntimeError(f"policy server returned error: {reply.get('error')}")
@@ -659,7 +654,7 @@ def run(args):
                     rospy.loginfo_throttle(1.0, f"dry-run action left={action[:7]} right={action[7:14]}")
                 else:
                     print(action)
-                    ros.publish_action(action) # 把action_chunk发布给master/joint_left和master/joint_right，控制机械臂执行动作
+                    ros.publish_action(action)
                     reset_start_state = action.copy()
                 step += 1
                 rospy.sleep(1.0 / args.control_rate)

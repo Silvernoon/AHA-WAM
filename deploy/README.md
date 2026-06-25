@@ -1,35 +1,38 @@
-# AHAWAM Real-Robot Deployment
+# AHA-WAM Real-Robot Deployment
 
-This directory contains the public real-robot deployment surface for AHAWAM:
+This directory provides server and client utilities for running AHA-WAM on a
+real robot.
 
 ```text
 deploy/
-├── deploy_example.yml          # Copy to deploy/deploy.yml and fill local paths
-├── common/tcp_protocol.py      # Length-prefixed TCP helpers
-├── server/ahawam_policy.py     # AHAWAM policy wrapper
-├── server/async_runtime.py     # Async video/action runtime
-├── server/wam_policy_server.py # TCP policy server
+├── deploy_example.yml                 # Example runtime config
+├── common/tcp_protocol.py             # Length-prefixed TCP helpers
+├── server/ahawam_policy.py            # AHA-WAM policy wrapper
+├── server/async_runtime.py            # Async video/action runtime
+├── server/wam_policy_server.py        # TCP policy server
 └── client/
-    ├── wam_policy_dummy_client.py         # Sync smoke test client
-    ├── wam_policy_async_dummy_client.py   # Async/dual-device protocol smoke test
+    ├── wam_policy_dummy_client.py         # Sync test client
+    ├── wam_policy_async_dummy_client.py   # Async/dual-device protocol test client
     └── wam_remote_client_node.py          # ROS robot-side client
 ```
 
-This is a reference server-client framework for real-robot deployment. It keeps
-the public protocol and runtime structure simple on purpose, and includes an
-asynchronous dual-stream WAM example where the video branch and action branch can
-run in separate workers/threads.
+The server receives robot observations over TCP and returns action chunks. The
+same server supports synchronous inference and asynchronous video/action serving.
+Use the asynchronous mode when the video branch and action branch should run at
+separate rates or on separate devices.
 
-The TCP transport uses Python pickle to preserve NumPy arrays. Only use it on a
+The TCP transport uses Python pickle to preserve NumPy arrays. Run it only on a
 trusted robot network.
 
-## 1. Prepare config
+## 1. Prepare the config
+
+Create a local runtime config from the example:
 
 ```bash
 cp deploy/deploy_example.yml deploy/deploy.yml
 ```
 
-Edit at least:
+Edit at least these fields:
 
 ```yaml
 checkpoint_path: ./checkpoints/your_checkpoint.pt
@@ -40,12 +43,12 @@ task: null
 ```
 
 `hydra_config_name: deploy` composes [`configs/deploy.yml`](../configs/deploy.yml).
-Set `task` only when you need to override the default task selected by that Hydra
-config.
+If `task` is left `null`, the task default from `configs/deploy.yml` is used. Set
+`task` to a task config name when you want to override that default.
 
 ## 2. Start the server
 
-Run on the GPU workstation:
+Run the policy server on the GPU workstation:
 
 ```bash
 python deploy/server/wam_policy_server.py \
@@ -58,7 +61,7 @@ python deploy/server/wam_policy_server.py \
   --port 10000
 ```
 
-Async single-worker mode:
+For single-process asynchronous serving:
 
 ```bash
 python deploy/server/wam_policy_server.py \
@@ -70,8 +73,7 @@ python deploy/server/wam_policy_server.py \
   --action-dim 14
 ```
 
-Async two-device mode. This demonstrates the dual-stream WAM runtime, with the
-video branch and action branch assigned to separate workers/devices:
+For dual-device asynchronous serving:
 
 ```bash
 python deploy/server/wam_policy_server.py \
@@ -85,9 +87,9 @@ python deploy/server/wam_policy_server.py \
   --action-dim 14
 ```
 
-## 3. Smoke test without ROS
+## 3. Test without ROS
 
-Use the sync dummy client for the regular `infer` request path:
+Use the sync test client for the regular `infer` request path:
 
 ```bash
 python deploy/client/wam_policy_dummy_client.py \
@@ -97,9 +99,9 @@ python deploy/client/wam_policy_dummy_client.py \
   --num-requests 1
 ```
 
-Use the async dummy client to exercise the dual-device protocol path. It opens
-separate image and action TCP channels, pushes `image` messages in the
-background, and sends `action_request` messages on the foreground channel:
+Use the async test client for the dual-device protocol path. It opens separate
+image and action TCP channels, pushes `image` messages in the background, and
+sends `action_request` messages on the foreground channel:
 
 ```bash
 python deploy/client/wam_policy_async_dummy_client.py \
@@ -113,7 +115,11 @@ Use the server IP instead of `127.0.0.1` when testing from another machine.
 
 ## 4. Run the ROS client
 
-Run on the robot computer after verifying camera/state topics and action limits:
+Run the ROS client on the robot computer after checking camera/state topics and
+action limits.
+
+For a synchronous server, the client sends one `infer` request whenever it needs
+a new action chunk:
 
 ```bash
 python deploy/client/wam_remote_client_node.py \
@@ -123,8 +129,26 @@ python deploy/client/wam_remote_client_node.py \
   --dry-run
 ```
 
-Remove `--dry-run` only after validating the received action chunks, ROS topics,
-joint limits, gripper limits, and emergency-stop procedure.
+For an asynchronous server started with `--async-mode` or `--dual-gpu-async`, use
+the decoupled image stream and action request protocol:
+
+```bash
+python deploy/client/wam_remote_client_node.py \
+  --server-ip <GPU_WORKSTATION_IP> \
+  --server-port 10000 \
+  --instruction "your task instruction" \
+  --async-policy-protocol \
+  --image-stream-rate 30 \
+  --dry-run
+```
+
+The async client switch is `--async-policy-protocol`. In this mode, the client
+keeps sending the latest camera frame on one TCP channel and requests action
+chunks on another channel. Tune `--image-stream-rate` for your camera, network,
+and server throughput; in real deployments, try several values and monitor
+end-to-end action latency and frame freshness. Start with `--dry-run` to inspect
+the received action chunks. Remove it after confirming the ROS topics, joint
+limits, gripper limits, and emergency-stop procedure for your robot.
 
 ## Message protocol
 
@@ -137,7 +161,7 @@ Sync request:
     "type": "infer",
     "instruction": "your task instruction",
     "state": np.ndarray,          # shape [14]
-    "images": {"front": image}, # uint8 HxWx3 RGB
+    "images": {"front": image},  # uint8 HxWx3 RGB
 }
 ```
 
@@ -146,9 +170,3 @@ Async mode additionally supports:
 - `{"type": "image", "images": {"front": image}}`
 - `{"type": "action_request", "state": state, "images": {"front": image}}`
 - `{"type": "reset", "instruction": "..."}`
-
-## Notes
-
-- The public release keeps the sync and async video/action protocols.
-- Private acceleration backends are intentionally omitted from this deployment surface.
-- The ROS client is a template for real hardware; audit safety limits before moving a robot.

@@ -457,8 +457,7 @@ python deploy/client/wam_remote_client_node.py \
   --dry-run
 ```
 
-See [`deploy/README.md`](./deploy/README.md) for the full server/client guide and
-safety notes.
+See [`deploy/`](./deploy/) for the full server/client guide and safety notes.
 
 <a id="results"></a>
 

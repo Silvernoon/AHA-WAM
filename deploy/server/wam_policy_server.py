@@ -114,7 +114,7 @@ class WAMPolicyAdapter:
     """Small compatibility layer around the policy implementation.
 
     Supported policy styles:
-      1. control_your_robot style:
+      1. windowed policy style:
          update_observation_window(img_arr, state); get_action()
       2. chunk style:
          predict_action_chunk(observation_dict)
@@ -210,8 +210,7 @@ class WAMPolicyAdapter:
             request_instruction,
         )
 
-        # Only img_arr[0] (front/head camera) is used by the model.
-        # Agilex deployment uses single head camera (num_output_cameras=1).
+        # Only img_arr[0] (front/head camera) is used by the deployment model.
         img_arr = [front]
 
         infer_t0 = time.perf_counter()
@@ -681,7 +680,7 @@ def dual_video_worker_main(args, request_queue, kv_queue, ready_queue):
         version = 0
         generation = 0
 
-        # Warmup: run N prefill rounds to trigger model warmup / model warmup paths compilation.
+        # Warmup: run N prefill rounds before accepting live requests.
         # Split into two phases to cover both execution paths:
         #   Phase 1 (cold-start): _hard_reset() before each prefill to cover the
         #       "fresh episode" path (model._inference_state == None).
@@ -820,13 +819,13 @@ def dual_action_worker_main(args, request_queue, response_queue, kv_queue, ready
         latest_video_ms = -1.0
         generation = 0
 
-        # Warmup: run N action chunk rounds to trigger model warmup / model warmup paths compilation
+        # Warmup: run N action chunk rounds before accepting live requests.
         if args.worker_warmup_rounds > 0:
             logger.info("Action worker starting warmup (%d rounds)...", args.worker_warmup_rounds)
             dummy_img = np.zeros((policy.video_height, policy.video_width, 3), dtype=np.uint8)
             dummy_state = np.zeros(args.action_dim, dtype=np.float32)
             policy.set_language_instruction(args.instruction or "warmup")
-            # First do a prefill to get a valid state state for action warmup
+            # First do a prefill to get a valid inference state for action warmup.
             policy._hard_reset()
             policy.update_observation_window(
                 [dummy_img], dummy_state,
@@ -961,7 +960,7 @@ def dual_action_worker_main(args, request_queue, response_queue, kv_queue, ready
                 policy.update_observation_window([front], state_vec)
                 image_tensor = policy._observation["image_tensor"]
                 proprio = policy._normalize_state(state_vec)
-                # Deep copy state state to prevent in-place tensor mutation
+                # Deep copy inference state to prevent in-place tensor mutation
                 # from corrupting latest_state for subsequent action requests
                 action_state = copy.deepcopy(latest_state)
                 action_state.pop("_chunk_video_kv_cache", None)

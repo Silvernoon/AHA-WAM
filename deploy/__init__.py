@@ -1,1 +1,1 @@
-"""Public real-robot deployment utilities for AHAWAM."""
+"""Real-robot deployment utilities for AHA-WAM."""
