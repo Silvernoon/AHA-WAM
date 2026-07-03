@@ -62,7 +62,18 @@ The key idea is that world prediction and action execution should not be forced
 to share the same temporal rhythm: world modeling benefits from a longer,
 slower horizon, while robot control needs fast closed-loop corrections.
 
+<a id="to-do-list"></a>
+
+## 📆 To Do List
+
+- [x] AHA-WAM training code and RoboTwin evaluation pipeline.
+- [x] ODE-distillation code for AHA-WAM-Flash acceleration.
+- [x] Real-robot deployment examples, including server-client execution and asynchronous dual-stream inference.
+- [x] RoboTwin-trained checkpoints for AHA-WAM and AHA-WAM-Flash.
+- [ ] Real-world pretrained checkpoints for easier deployment, including FastWAM and AHA-WAM.
+
 <a id="repository-layout"></a>
+
 
 ## 🗂️ Repository Layout
 
