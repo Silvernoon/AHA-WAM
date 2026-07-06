@@ -27,6 +27,7 @@
 - [🦾 Real-Robot Deployment](#real-robot-deployment)
 - [📊 Results](#results)
 - [📌 Citation](#citation)
+- [💬 Community](#community)
 
 **AHA-WAM** is an asynchronous world-action model for robot manipulation. It
 decouples a slow video-DiT world planner from a fast action-DiT executor, then
@@ -535,6 +536,16 @@ If you find AHA-WAM useful, please cite the project:
   year={2026}
 }
 ```
+
+<a id="community"></a>
+
+## 💬 Community
+
+Welcome to join the AHA-WAM discussion group for updates and technical exchange:
+
+<div align="center">
+  <img src="assets/chat.jpg" alt="AHA-WAM discussion group QR code" width="360">
+</div>
 
 ## 📄 License
 
