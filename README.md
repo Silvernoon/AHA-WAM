@@ -7,6 +7,7 @@
 [![Project Page](https://img.shields.io/badge/Project-Page-2f80ed.svg)](https://serene-sivy.github.io/aha-wam/)
 [![arXiv](https://img.shields.io/badge/arXiv-2606.09811-b31b1b.svg)](https://arxiv.org/abs/2606.09811)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Checkpoint-AHA--WAM--RoboTwin2.0-ffcc00.svg)](https://huggingface.co/SereneC/AHA-WAM-RoboTwin2.0)
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Pretrained-AHA--WAM--Pretrained-ffcc00.svg)](https://huggingface.co/SereneC/AHA-WAM-Pretrained)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
 <br>
@@ -35,8 +36,11 @@ uses observation-guided context routing to keep the reused world context aligned
 with the latest closed-loop robot state.
 
 This repository contains AHA-WAM training, RoboTwin evaluation, and real-robot
-deployment code. We also release a RoboTwin2.0 checkpoint on Hugging Face:
-[SereneC/AHA-WAM-RoboTwin2.0](https://huggingface.co/SereneC/AHA-WAM-RoboTwin2.0).
+deployment code. We release the RoboTwin2.0 task checkpoint and RoboCOIN
+pretrained initialization checkpoints on Hugging Face:
+[SereneC/AHA-WAM-RoboTwin2.0](https://huggingface.co/SereneC/AHA-WAM-RoboTwin2.0)
+and
+[SereneC/AHA-WAM-Pretrained](https://huggingface.co/SereneC/AHA-WAM-Pretrained).
 
 <a id="highlights"></a>
 
@@ -71,7 +75,7 @@ slower horizon, while robot control needs fast closed-loop corrections.
 - [x] ODE-distillation code for AHA-WAM-Flash acceleration.
 - [x] Real-robot deployment examples, including server-client execution and asynchronous dual-stream inference.
 - [x] RoboTwin-trained checkpoints for AHA-WAM and AHA-WAM-Flash.
-- [ ] Real-world pretrained checkpoints for easier deployment, including FastWAM and AHA-WAM.
+- [x] RoboCOIN-pretrained checkpoints for easier real-robot adaptation, including Fast-WAM and AHA-WAM.
 
 <a id="repository-layout"></a>
 
@@ -134,6 +138,8 @@ This project uses three kinds of model assets:
    `scripts/preprocess_action_dit_backbone.py`.
 3. **AHA-WAM RoboTwin checkpoint**: the released task checkpoint
    `robotwin_ahawam.pt` and its `dataset_stats.json`.
+4. **RoboCOIN pretrained checkpoints**: released initialization checkpoints for
+   AHA-WAM and our Fast-WAM reproduction.
 
 ### Wan Base Components
 
@@ -232,6 +238,42 @@ model = model.cuda().eval()
 
 See the Hugging Face model card for more details:
 [SereneC/AHA-WAM-RoboTwin2.0](https://huggingface.co/SereneC/AHA-WAM-RoboTwin2.0).
+
+### Released RoboCOIN Pretrained Checkpoints
+
+We also release RoboCOIN-pretrained initialization checkpoints for AHA-WAM and
+Fast-WAM:
+
+```bash
+huggingface-cli download SereneC/AHA-WAM-Pretrained \
+  AHA-WAM-pretrained.pt Fast-WAM-pretrained.pt \
+  --local-dir checkpoints/AHA-WAM-Pretrained
+```
+
+Both checkpoints were pretrained for **45k steps** on a selected subset of
+RoboCOIN to make downstream real-robot fine-tuning and deployment easier. Use
+them as weight initialization with `init_checkpoint`:
+
+```bash
+# Fine-tune AHA-WAM from the RoboCOIN-pretrained checkpoint.
+bash scripts/train_zero1.sh 8 \
+  task=<your_task_config> \
+  model=ahawam \
+  init_checkpoint=checkpoints/AHA-WAM-Pretrained/AHA-WAM-pretrained.pt
+
+# Fine-tune Fast-WAM from our reproduced RoboCOIN-pretrained checkpoint.
+bash scripts/train_zero1.sh 8 \
+  task=<your_task_config> \
+  model=fastwam \
+  init_checkpoint=checkpoints/AHA-WAM-Pretrained/Fast-WAM-pretrained.pt
+```
+
+The released `Fast-WAM-pretrained.pt` is provided for reference and is our
+reproduction version within this codebase. For a fair comparison with the
+original Fast-WAM, please control data, preprocessing, architecture, training
+schedule, inference settings, and evaluation protocol carefully. See the
+Hugging Face model card for details:
+[SereneC/AHA-WAM-Pretrained](https://huggingface.co/SereneC/AHA-WAM-Pretrained).
 
 <a id="data-preparation"></a>
 
