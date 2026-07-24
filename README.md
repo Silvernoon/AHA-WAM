@@ -75,7 +75,7 @@ slower horizon, while robot control needs fast closed-loop corrections.
 - [x] ODE-distillation code for AHA-WAM-Flash acceleration.
 - [x] Real-robot deployment examples, including server-client execution and asynchronous dual-stream inference.
 - [x] RoboTwin-trained checkpoints for AHA-WAM and AHA-WAM-Flash.
-- [x] RoboCOIN-pretrained checkpoints for easier real-robot adaptation, including Fast-WAM and AHA-WAM.
+- [] RoboCOIN-pretrained checkpoints for easier real-robot adaptation, including Fast-WAM and AHA-WAM. (Fast-WAM to be updated)
 
 <a id="repository-layout"></a>
 
