@@ -44,6 +44,14 @@ shared=True, views=3, history=6, horizon=80, offset=15, chunk=16
 - CuRobo 已用 `TORCH_CUDA_ARCH_LIST=8.9` 重编，`CuroboPlanner` 可以正常初始化。
 - 评估画面仍明显偏白、低对比度，与训练视频存在视觉域差异。
 
+### 本轮已确认的部署偏差
+
+- Teacher 实际训练产物 `config.yaml` 的 `model.video_rope_frame_stride` 为 `8`，而此前评估配置硬编码为 `1`。这会让每次 32-action video prefill 的时序位置前进 `32`，训练契约应前进 `32 / 8 = 4`。评估配置已改为 `${data.train.action_video_freq_ratio}`，当前解析值为 `8`。
+- Teacher 训练启用 `preserve_camera_views`，每路图像先变为 `240x320`，再按 `video_size=[384,320]` 做保持比例 resize 和中心裁剪；此前部署直接使用 `256x320` 全视野图像，既改变了视场也改变了 VAE latent 网格。部署预处理已改为复现训练的两阶段 resize、BICUBIC resize 和中心裁剪，warmup 尺寸同步为 `384x320`。
+- 训练与部署 `dataset_stats.json` SHA-256 均为 `7a02c46cfc8c5e746c0afbe41fca73f723eda34cbc083f8ca54f76d8f7468095`。
+- 数据集元数据显示动作和状态均为 50 FPS、14D，顺序为左臂 7D、右臂 7D；与 RoboTwin `get_obs()` 的 `left_arm + left_gripper + right_arm + right_gripper` 顺序一致。
+- 修正后 A800 真实 checkpoint smoke 通过：输入尺寸 `384x320`、RoPE stride `8`、输出 `(14,)`、全部 finite；这只证明推理链可运行，不证明闭环成功。
+
 ## 优先排查项
 
 ### 1. 视觉域偏移

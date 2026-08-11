@@ -10,7 +10,7 @@ model:
   max_action_offset: 15
   num_history_frames: 6
   action_video_read_mode: current_only
-  video_rope_frame_stride: 1
+  video_rope_frame_stride: ${data.train.action_video_freq_ratio}
 
 data:
   train:

@@ -135,6 +135,37 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _preprocess_camera_rgb(
+    image: np.ndarray,
+    *,
+    processor_size_hw: tuple[int, int],
+    video_size_hw: tuple[int, int],
+) -> np.ndarray:
+    """Mirror RobotVideoDataset's per-camera resize and center crop."""
+    processor_height, processor_width = processor_size_hw
+    video_height, video_width = video_size_hw
+    resized = Image.fromarray(image.astype(np.uint8), mode="RGB").resize(
+        (processor_width, processor_height),
+        resample=Image.BILINEAR,
+    )
+    scale = max(
+        video_width / processor_width,
+        video_height / processor_height,
+    )
+    scaled_width = int(scale * processor_width + 0.5)
+    scaled_height = int(scale * processor_height + 0.5)
+    resized = resized.resize(
+        (scaled_width, scaled_height),
+        resample=Image.BICUBIC,
+    )
+    left = (scaled_width - video_width) // 2
+    top = (scaled_height - video_height) // 2
+    cropped = resized.crop(
+        (left, top, left + video_width, top + video_height)
+    )
+    return np.asarray(cropped, dtype=np.uint8)
+
+
 class WorldActionRobotWinPolicy:
     def __init__(
         self,
@@ -154,12 +185,28 @@ class WorldActionRobotWinPolicy:
         rand_device: str,
         tiled: bool,
         timing_enabled: bool,
+        video_size_hw: tuple[int, int],
     ) -> None:
         self.num_views = int(
             OmegaConf.select(model_cfg, "shared_visual_config.num_views", default=1)
         )
         if self.num_views not in (1, 2, 3):
             raise ValueError(f"Unsupported deployment view count: {self.num_views}")
+        video_height, video_width = (int(value) for value in video_size_hw)
+        if video_height <= 0 or video_width <= 0:
+            raise ValueError(f"Invalid deployment video size: {video_size_hw}")
+        self.video_height = video_height
+        self.video_width = video_width
+        camera_shapes = [
+            tuple(int(value) for value in meta["shape"][-2:])
+            for meta in processor_cfg.shape_meta.images
+        ]
+        if not camera_shapes or any(shape != camera_shapes[0] for shape in camera_shapes):
+            raise ValueError(
+                "Deployment requires identical processor camera sizes, "
+                f"got {camera_shapes}."
+            )
+        self.processor_camera_size_hw = camera_shapes[0]
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
 
@@ -224,7 +271,9 @@ class WorldActionRobotWinPolicy:
             self._timing_rollout[f"chunk_{chunk_idx + 1}_calls"] = 0.0
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | chunk=%d | num_chunks=%d | chunks_per_video_prefill=%d | video_prefill_horizon=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | "
+            "horizon=%d | chunk=%d | num_chunks=%d | chunks_per_video_prefill=%d | "
+            "video_prefill_horizon=%d | camera_resize=%s | video_crop=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
@@ -232,26 +281,22 @@ class WorldActionRobotWinPolicy:
             self.num_chunks,
             self.chunks_per_video_prefill,
             self.video_prefill_action_horizon,
+            self.processor_camera_size_hw,
+            (self.video_height, self.video_width),
         )
         self._warmup()
 
     def _warmup(self) -> None:
         """Run one dummy inference pass so compile overhead is paid during init."""
-        if self.num_views == 2:
+        if self.num_views > 1:
             dummy_image = torch.zeros(
-                (self.num_views, 3, 192, 320),
-                device=self.model.device,
-                dtype=self.model.torch_dtype,
-            )
-        elif self.num_views > 1:
-            dummy_image = torch.zeros(
-                (self.num_views, 3, 256, 320),
+                (self.num_views, 3, self.video_height, self.video_width),
                 device=self.model.device,
                 dtype=self.model.torch_dtype,
             )
         else:
             dummy_image = torch.zeros(
-                (1, 3, 384, 320),
+                (1, 3, self.video_height, self.video_width),
                 device=self.model.device,
                 dtype=self.model.torch_dtype,
             )
@@ -426,14 +471,25 @@ class WorldActionRobotWinPolicy:
             image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
             image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
         else:
-            view_size = (320, 256)
-            head = _resize_rgb(obs_data["head_camera"]["rgb"], view_size)
-            left = _resize_rgb(obs_data["left_camera"]["rgb"], view_size)
-            right = _resize_rgb(obs_data["right_camera"]["rgb"], view_size)
-            if self.num_views == 2:
-                views = np.stack([left, right], axis=0)
-            else:
-                views = np.stack([head, left, right], axis=0)
+            head = _preprocess_camera_rgb(
+                obs_data["head_camera"]["rgb"],
+                processor_size_hw=self.processor_camera_size_hw,
+                video_size_hw=(self.video_height, self.video_width),
+            )
+            left = _preprocess_camera_rgb(
+                obs_data["left_camera"]["rgb"],
+                processor_size_hw=self.processor_camera_size_hw,
+                video_size_hw=(self.video_height, self.video_width),
+            )
+            right = _preprocess_camera_rgb(
+                obs_data["right_camera"]["rgb"],
+                processor_size_hw=self.processor_camera_size_hw,
+                video_size_hw=(self.video_height, self.video_width),
+            )
+            views = np.stack(
+                [left, right] if self.num_views == 2 else [head, left, right],
+                axis=0,
+            )
             image_tensor = torch.from_numpy(views).permute(0, 3, 1, 2)
 
         image_tensor = image_tensor.to(
@@ -623,6 +679,9 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    video_size = tuple(int(value) for value in cfg.data.train.video_size)
+    if len(video_size) != 2:
+        raise ValueError(f"`data.train.video_size` must be [H,W], got {video_size}.")
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
@@ -641,6 +700,7 @@ def get_model(usr_args: Dict[str, Any]):
         rand_device=rand_device,
         tiled=tiled,
         timing_enabled=timing_enabled,
+        video_size_hw=video_size,
     )
     return policy
 
