@@ -123,6 +123,18 @@ def get_camera_config(camera_type):
     assert camera_type in args, f"camera {camera_type} is not defined"
     return args[camera_type]
 
+def get_eval_video_size(args):
+    head_camera_cfg = get_camera_config(args["camera"]["head_camera_type"])
+    video_w = int(head_camera_cfg["w"])
+    video_h = int(head_camera_cfg["h"])
+
+    if args["camera"].get("collect_wrist_camera", False):
+        wrist_camera_cfg = get_camera_config(args["camera"]["wrist_camera_type"])
+        video_w = max(video_w, int(wrist_camera_cfg["w"]) * 2)
+        video_h += int(wrist_camera_cfg["h"])
+
+    return f"{video_w}x{video_h}"
+
 
 def get_embodiment_config(robot_file):
     robot_config_file = os.path.join(robot_file, "config.yml")
@@ -293,8 +305,7 @@ def main(usr_args):
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
-        camera_config = get_camera_config(args["camera"]["head_camera_type"])
-        video_size = str(camera_config["w"]) + "x" + str(camera_config["h"])
+        video_size = get_eval_video_size(args)
         video_save_dir.mkdir(parents=True, exist_ok=True)
         args["eval_video_save_dir"] = video_save_dir
 
@@ -323,14 +334,16 @@ def main(usr_args):
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
 
     seed = usr_args["seed"]
-
-    st_seed = 100000 * (1 + seed)
+    start_seed = usr_args.get("start_seed")
+    st_seed = int(start_seed) if start_seed is not None else 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = int(usr_args.get("eval_num_episodes", 100))
+    if test_num <= 0:
+        raise ValueError(f"`eval_num_episodes` must be positive, got {test_num}")
     topk = 1
 
-    # model = get_model(usr_args)
-    model = ModelClient(port=port)
+    request_timeout = float(usr_args.get("request_timeout", 30))
+    model = ModelClient(port=port, timeout=request_timeout)
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
                                    args,

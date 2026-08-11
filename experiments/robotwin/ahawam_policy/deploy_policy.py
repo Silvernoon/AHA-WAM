@@ -155,6 +155,11 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
     ) -> None:
+        self.num_views = int(
+            OmegaConf.select(model_cfg, "shared_visual_config.num_views", default=1)
+        )
+        if self.num_views not in (1, 2, 3):
+            raise ValueError(f"Unsupported deployment view count: {self.num_views}")
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
 
@@ -232,12 +237,24 @@ class WorldActionRobotWinPolicy:
 
     def _warmup(self) -> None:
         """Run one dummy inference pass so compile overhead is paid during init."""
-        logger.info("Running warmup inference for deploy policy.")
-        dummy_image = torch.zeros(
-            (1, 3, 384, 320),
-            device=self.model.device,
-            dtype=self.model.torch_dtype,
-        )
+        if self.num_views == 2:
+            dummy_image = torch.zeros(
+                (self.num_views, 3, 192, 320),
+                device=self.model.device,
+                dtype=self.model.torch_dtype,
+            )
+        elif self.num_views > 1:
+            dummy_image = torch.zeros(
+                (self.num_views, 3, 256, 320),
+                device=self.model.device,
+                dtype=self.model.torch_dtype,
+            )
+        else:
+            dummy_image = torch.zeros(
+                (1, 3, 384, 320),
+                device=self.model.device,
+                dtype=self.model.torch_dtype,
+            )
         dummy_proprio = None
         if self.model.proprio_dim is not None:
             dummy_proprio = torch.zeros(
@@ -401,13 +418,25 @@ class WorldActionRobotWinPolicy:
 
     def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
         obs_data = observation["observation"]
-        head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
-        left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
-        right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
-        bottom = np.concatenate([left, right], axis=1)
-        image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
+        if self.num_views == 1:
+            head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
+            left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
+            right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
+            bottom = np.concatenate([left, right], axis=1)
+            image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
+            image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
+        else:
+            view_size = (320, 256)
+            head = _resize_rgb(obs_data["head_camera"]["rgb"], view_size)
+            left = _resize_rgb(obs_data["left_camera"]["rgb"], view_size)
+            right = _resize_rgb(obs_data["right_camera"]["rgb"], view_size)
+            if self.num_views == 2:
+                views = np.stack([left, right], axis=0)
+            else:
+                views = np.stack([head, left, right], axis=0)
+            image_tensor = torch.from_numpy(views).permute(0, 3, 1, 2)
 
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
+        image_tensor = image_tensor.to(
             device=self.model.device,
             dtype=self.model.torch_dtype,
         )
@@ -463,27 +492,30 @@ class WorldActionRobotWinPolicy:
     def should_request_observation(self) -> bool:
         return not self.pending_actions
 
-    def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+    def predict_action(self, observation: Dict[str, Any]) -> np.ndarray:
+        instruction = observation.get("_instruction")
+        if not isinstance(instruction, str) or not instruction:
+            raise ValueError("Remote action prediction requires `_instruction` in observation.")
         if self.should_request_observation():
-            if observation is None:
-                raise ValueError(
-                    "Observation is required when action queue is empty "
-                    "(chunk step for ahawam deploy)."
-                )
-            instruction = task_env.get_instruction()
             self._fill_action_queue(observation=observation, instruction=instruction)
-
         if self.should_request_observation():
-            logger.warning("No action generated; skip current eval step.")
-            assert False
-            return
+            raise RuntimeError("No action generated for the current observation.")
+        self.step_count += 1
+        return self.pending_actions.popleft()
 
-        action = self.pending_actions.popleft()
+    def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
+        if observation is None and self.should_request_observation():
+            raise ValueError(
+                "Observation is required when action queue is empty "
+                "(chunk step for ahawam deploy)."
+            )
+        payload = {} if observation is None else dict(observation)
+        payload["_instruction"] = task_env.get_instruction()
+        action = self.predict_action(payload)
         sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
         task_env.take_action(action, action_type="qpos")
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
-        self.step_count += 1
 
     def reset_timing_rollout(self) -> None:
         self._timing_rollout["infer_s"] = 0.0
@@ -522,6 +554,10 @@ class WorldActionRobotWinPolicy:
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()
+
+    def reset_model(self) -> None:
+        self.reset()
+
 
 
 def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -611,6 +647,14 @@ def get_model(usr_args: Dict[str, Any]):
 
 def eval(TASK_ENV, model, observation: Optional[Dict[str, Any]]):
     obs = encode_obs(observation)
+    if hasattr(model, "call"):
+        if obs is None:
+            raise ValueError("Remote policy evaluation requires an observation.")
+        payload = dict(obs)
+        payload["_instruction"] = TASK_ENV.get_instruction()
+        action = model.call(func_name="predict_action", obs=payload)
+        TASK_ENV.take_action(np.asarray(action, dtype=np.float32), action_type="qpos")
+        return
     model.step(TASK_ENV, obs)
 
 

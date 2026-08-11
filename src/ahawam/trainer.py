@@ -452,8 +452,13 @@ class Wan22Trainer:
             self._resume_weights_preloaded = True
             return
 
-        # Case: state directory — check if DDP format (incompatible with DeepSpeed)
-        if self._is_ddp_state_dir(resume_path):
+        # A plain single-process/CPU/GPU Accelerator also writes a top-level
+        # `model.safetensors`. Treat that state as fully resumable unless the
+        # current run actually uses DeepSpeed.
+        uses_deepspeed = (
+            getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        )
+        if self._is_ddp_state_dir(resume_path) and uses_deepspeed:
             logger.warning(
                 "State directory %s was saved under DDP but current config uses "
                 "DeepSpeed. Loading model weights only (before prepare) and "
@@ -463,7 +468,6 @@ class Wan22Trainer:
             self._load_model_weights_from_ddp_state(resume_path)
             self._resume_weights_preloaded = True
             self._resume_state_dir_is_ddp = True
-
     @staticmethod
     def _is_ddp_state_dir(state_dir: Path) -> bool:
         """Detect whether a state directory was saved under plain DDP (not DeepSpeed).
@@ -740,11 +744,20 @@ class Wan22Trainer:
             )
         if video.ndim == 4:
             video = video.unsqueeze(0)
-        if video.ndim != 5:
+        elif video.ndim == 5 and video.shape[2] == 3:
+            if video.shape[0] <= 4 and video.shape[1] > 4:
+                # Validation layout: [V,T,3,H,W] -> [B,T,V,3,H,W].
+                video = video.permute(1, 0, 2, 3, 4).unsqueeze(0).contiguous()
+            else:
+                # Dataset training layout: [T,V,3,H,W] -> [B,T,V,3,H,W].
+                video = video.unsqueeze(0).contiguous()
+        if video.ndim not in (5, 6):
             raise ValueError(
-                f"Expected video shape [3,T,H,W] or [B,3,T,H,W], got {tuple(video.shape)}"
+                "Expected video shape [3,T,H,W], [B,3,T,H,W], or "
+                "[B,T,V,3,H,W], got "
+                f"{tuple(video.shape)}"
             )
-        num_video_frames = video.shape[2]
+        num_video_frames = video.shape[1] if video.ndim == 6 else video.shape[2]
         if num_video_frames <= 1:
             raise ValueError(
                 f"`sample['video']` must have at least 2 frames for action evaluation, got {num_video_frames}"
@@ -828,9 +841,19 @@ class Wan22Trainer:
                     raise TypeError(f"`sample['{key}']` must be a torch.Tensor, got {type(value)}")
                 if value.ndim == 4:
                     value = value.unsqueeze(0)
-                if value.ndim != 5 or int(value.shape[0]) != int(video.shape[0]):
+                elif (
+                    value.ndim == 5
+                    and video.ndim == 6
+                    and int(value.shape[1]) == int(video.shape[2])
+                    and int(value.shape[2]) == 3
+                ):
+                    value = value.unsqueeze(0)
+                if value.ndim not in (5, 6) or int(value.shape[0]) != int(
+                    video.shape[0]
+                ):
                     raise ValueError(
-                        f"`{key}` must be [N,3,H,W] or [B,N,3,H,W], "
+                        f"`{key}` must be [N,3,H,W], [B,N,3,H,W], "
+                        "[N,V,3,H,W], or [B,N,V,3,H,W], "
                         f"got shape {tuple(value.shape)} for batch={video.shape[0]}."
                     )
             optional_tensors[key] = value
@@ -848,9 +871,17 @@ class Wan22Trainer:
                 )
             if video_history.ndim == 4:
                 video_history = video_history.unsqueeze(0)
-            if video_history.ndim != 5:
+            elif (
+                video_history.ndim == 5
+                and video.ndim == 6
+                and int(video_history.shape[1]) == int(video.shape[2])
+                and int(video_history.shape[2]) == 3
+            ):
+                video_history = video_history.unsqueeze(0)
+            if video_history.ndim not in (5, 6):
                 raise ValueError(
-                    "`sample['video_history']` must be [B,C,N,H,W], "
+                    "`sample['video_history']` must be [B,C,N,H,W] or "
+                    "[B,N,V,C,H,W], "
                     f"got shape {tuple(video_history.shape)}"
                 )
             if video_history.shape[0] != video.shape[0]:
@@ -887,10 +918,12 @@ class Wan22Trainer:
             )
             if video_history_frame_indices.ndim == 1:
                 video_history_frame_indices = video_history_frame_indices.unsqueeze(0)
+            history_time_dim = 1 if video_history.ndim == 6 else 2
             if (
                 video_history_frame_indices.ndim != 2
                 or video_history_frame_indices.shape[0] != video.shape[0]
-                or video_history_frame_indices.shape[1] != video_history.shape[2]
+                or video_history_frame_indices.shape[1]
+                != video_history.shape[history_time_dim]
             ):
                 raise ValueError(
                     "`video_history_frame_indices` must be [B,N], "

@@ -17,7 +17,6 @@ from collections import deque
 sys.path.append("./")
 sys.path.append(f"./policy")
 sys.path.append("./description/utils")
-from envs._GLOBAL_CONFIGS import CONFIGS_PATH
 
 import numpy as np
 from typing import Any

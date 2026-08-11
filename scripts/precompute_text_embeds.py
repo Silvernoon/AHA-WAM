@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from ahawam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from ahawam.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
+from ahawam.datasets.lerobot.base_lerobot_dataset import select_episode_indices
 from ahawam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 from ahawam.utils.config_resolvers import register_default_resolvers
 from ahawam.utils.logging_config import get_logger, setup_logging
@@ -67,8 +68,8 @@ def _iter_dataset_nodes(node: Any, path: str = "data"):
             yield from _iter_dataset_nodes(value, f"{path}[{idx}]")
 
 
-def _collect_dataset_settings(data_cfg: DictConfig):
-    dataset_dirs: list[str] = []
+def _collect_dataset_settings(data_cfg: DictConfig, *, seed: int = 42):
+    dataset_specs: list[dict[str, Any]] = []
     cache_dirs: list[Path] = []
     context_lens = set()
 
@@ -83,12 +84,6 @@ def _collect_dataset_settings(data_cfg: DictConfig):
                 f"Missing `text_embedding_cache_dir` for dataset node `{node_path}` "
                 "(this node defines `dataset_dirs`)."
             )
-
-        for ds in raw_dirs:
-            ds_str = str(ds)
-            if ds_str not in dataset_dirs:
-                dataset_dirs.append(ds_str)
-
         cache_dir_path = Path(str(cache_dir)).expanduser()
         if cache_dir_path not in cache_dirs:
             cache_dirs.append(cache_dir_path)
@@ -97,9 +92,27 @@ def _collect_dataset_settings(data_cfg: DictConfig):
         if context_len is not None:
             context_lens.add(int(context_len))
 
-        logger.info("Discovered dataset node `%s` with %d dataset_dirs.", node_path, len(raw_dirs))
+        max_episodes = node.get("max_episodes_per_dataset")
+        for ds in raw_dirs:
+            dataset_specs.append(
+                {
+                    "dataset_dir": str(ds),
+                    "is_training_set": bool(node.get("is_training_set", False)),
+                    "val_set_proportion": float(node.get("val_set_proportion", 0.05)),
+                    "seed": int(seed),
+                    "max_episodes": (
+                        None if max_episodes is None else int(max_episodes)
+                    ),
+                }
+            )
 
-    return dataset_dirs, cache_dirs, context_lens
+        logger.info(
+            "Discovered dataset node `%s` with %d dataset_dirs.",
+            node_path,
+            len(raw_dirs),
+        )
+
+    return dataset_specs, cache_dirs, context_lens
 
 
 def _resolve_context_len(context_lens: set[int]) -> int:
@@ -111,35 +124,68 @@ def _resolve_context_len(context_lens: set[int]) -> int:
     return next(iter(context_lens))
 
 
-def _read_unique_prompts(dataset_dirs: list[str]) -> list[str]:
+def _read_unique_prompts(dataset_specs: list[dict[str, Any]]) -> list[str]:
     prompts: list[str] = []
     seen = set()
     total_task_rows = 0
 
-    for ds_dir in dataset_dirs:
-        tasks_path = Path(ds_dir) / "meta" / "tasks.jsonl"
-        if not tasks_path.exists():
-            raise FileNotFoundError(f"Missing tasks file: {tasks_path}")
+    for spec in dataset_specs:
+        ds_dir = Path(spec["dataset_dir"])
+        info_path = ds_dir / "meta" / "info.json"
+        episodes_path = ds_dir / "meta" / "episodes.jsonl"
+        if not info_path.exists():
+            raise FileNotFoundError(f"Missing dataset info: {info_path}")
+        if not episodes_path.exists():
+            raise FileNotFoundError(f"Missing episodes metadata: {episodes_path}")
 
-        with tasks_path.open("r", encoding="utf-8") as f:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        selected_episodes = set(
+            select_episode_indices(
+                total_episodes=int(info["total_episodes"]),
+                val_set_proportion=float(spec["val_set_proportion"]),
+                is_training_set=bool(spec["is_training_set"]),
+                seed=int(spec["seed"]),
+                max_episodes=spec["max_episodes"],
+            )
+        )
+        selected_rows = 0
+        with episodes_path.open("r", encoding="utf-8") as f:
             for line_idx, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 record = json.loads(line)
-                if "task" not in record:
-                    raise KeyError(f"Missing `task` field at {tasks_path}:{line_idx}")
-                task = str(record["task"])
-                prompt = DEFAULT_PROMPT.format(task=task)
-                total_task_rows += 1
-                if prompt not in seen:
-                    seen.add(prompt)
-                    prompts.append(prompt)
+                if int(record["episode_index"]) not in selected_episodes:
+                    continue
+                selected_rows += 1
+                tasks = record.get("tasks")
+                if not isinstance(tasks, list):
+                    raise TypeError(
+                        f"`tasks` must be a list at {episodes_path}:{line_idx}."
+                    )
+                for task in tasks:
+                    prompt = DEFAULT_PROMPT.format(task=str(task))
+                    total_task_rows += 1
+                    if prompt not in seen:
+                        seen.add(prompt)
+                        prompts.append(prompt)
+
+        if selected_rows != len(selected_episodes):
+            raise ValueError(
+                f"Selected {len(selected_episodes)} episodes for {ds_dir}, "
+                f"but found metadata for {selected_rows}."
+            )
+        logger.info(
+            "Selected %d episodes from %s for text cache generation.",
+            selected_rows,
+            ds_dir,
+        )
 
     logger.info(
-        "Loaded %d task rows from %d datasets, deduplicated to %d prompts.",
+        "Loaded %d selected episode tasks from %d dataset splits, "
+        "deduplicated to %d prompts.",
         total_task_rows,
-        len(dataset_dirs),
+        len(dataset_specs),
         len(prompts),
     )
     return prompts
@@ -187,7 +233,9 @@ def main(cfg: DictConfig):
     if cfg.data is None:
         raise ValueError("`cfg.data` is required.")
 
-    dataset_dirs, cache_dirs, context_lens = _collect_dataset_settings(cfg.data)
+    dataset_specs, cache_dirs, context_lens = _collect_dataset_settings(
+        cfg.data, seed=int(cfg.get("seed", 42))
+    )
     if not cache_dirs:
         raise ValueError("No `text_embedding_cache_dir` found under `cfg.data`.")
 
@@ -197,9 +245,9 @@ def main(cfg: DictConfig):
         prompts = [override_prompt]
         logger.info("Using override_instruction; skipping dataset scan and encoding exactly 1 prompt.")
     else:
-        if not dataset_dirs:
+        if not dataset_specs:
             raise ValueError("No `dataset_dirs` found under `cfg.data`.")
-        prompts = _read_unique_prompts(dataset_dirs)
+        prompts = _read_unique_prompts(dataset_specs)
     if not prompts:
         logger.warning("No prompts found from tasks.jsonl; nothing to do.")
         return

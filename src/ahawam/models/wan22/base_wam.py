@@ -615,15 +615,21 @@ class BaseWAM(torch.nn.Module, ABC):
                     f"got {tuple(image_is_pad.shape)} vs expected ({batch_size}, {num_frames})"
                 )
 
-        video_latent_cache_paths = self._normalize_video_latent_cache_paths(
-            sample.get("video_latent_cache_path", None),
-            batch_size=batch_size,
-        )
-        input_latents, cached_first_frame_latents = self._load_or_compute_video_latents(
-            video,
-            video_latent_cache_paths,
-            tiled=tiled,
-        )
+        precomputed_latents = sample.get("_precomputed_input_latents")
+        precomputed_first = sample.get("_precomputed_first_frame_latents")
+        if precomputed_latents is not None:
+            input_latents = precomputed_latents
+            cached_first_frame_latents = precomputed_first
+        else:
+            video_latent_cache_paths = self._normalize_video_latent_cache_paths(
+                sample.get("video_latent_cache_path", None),
+                batch_size=batch_size,
+            )
+            input_latents, cached_first_frame_latents = self._load_or_compute_video_latents(
+                video,
+                video_latent_cache_paths,
+                tiled=tiled,
+            )
 
         first_frame_latents = None
         fuse_flag = False
@@ -691,9 +697,13 @@ class BaseWAM(torch.nn.Module, ABC):
         image_is_pad: Optional[torch.Tensor],
         include_initial_video_step: bool,
     ) -> torch.Tensor:
-        video_loss_token = F.mse_loss(
+        video_loss_element = F.mse_loss(
             pred_video.float(), target_video.float(), reduction="none"
-        ).mean(dim=(1, 3, 4))
+        )
+        if video_loss_element.ndim == 6:
+            video_loss_token = video_loss_element.mean(dim=(1, 2, 4, 5))
+        else:
+            video_loss_token = video_loss_element.mean(dim=(1, 3, 4))
         if image_is_pad is None:
             return video_loss_token.mean(dim=1)
 
@@ -1011,6 +1021,15 @@ class BaseWAM(torch.nn.Module, ABC):
                 "mask": video_pre["context_mask"],
             },
             video_attention_mask=video_attention_mask,
+            video_view_shape=(
+                (
+                    int(video_pre["meta"]["grid_size"][0]),
+                    int(video_pre["meta"]["num_views"]),
+                    int(video_pre["meta"]["tokens_per_view_frame"]),
+                )
+                if int(video_pre["meta"].get("num_views", 1)) > 1
+                else None
+            ),
         )
 
     @torch.no_grad()
@@ -1276,9 +1295,13 @@ class BaseWAM(torch.nn.Module, ABC):
             if "proprio" in sample and sample["proprio"] is not None
             else None
         )
-        input_image = video0[:, 0].unsqueeze(0)
-        _, num_frames, _, _ = video0.shape
-
+        if video0.ndim == 5:
+            # Multi-view evaluation layout: [T,V,C,H,W].
+            input_image = video0[0].unsqueeze(0)
+            num_frames = int(video0.shape[0])
+        else:
+            input_image = video0[:, 0].unsqueeze(0)
+            _, num_frames, _, _ = video0.shape
         infer_kwargs = {
             "input_image": input_image,
             "num_frames": num_frames,
@@ -1333,6 +1356,9 @@ class BaseWAM(torch.nn.Module, ABC):
             return result
 
         video0 = sample["video"][0]
+        if video0.ndim == 5:
+            # Report reconstruction metrics on the reference/high view.
+            video0 = video0[:, 0].permute(1, 0, 2, 3).contiguous()
         gt_video_tensor = (
             (video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5
         ).contiguous()

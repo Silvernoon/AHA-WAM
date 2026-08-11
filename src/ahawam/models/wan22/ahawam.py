@@ -188,57 +188,98 @@ class AHAWAM(AHAWAMChunkBase):
         history = sample["video_history"].to(
             device=self.device, dtype=self.torch_dtype, non_blocking=True
         )
-        if history.ndim != 5:
+        if history.ndim == 5:
+            if (
+                int(history.shape[0]) != batch_size
+                or int(history.shape[2]) < num_history_frames
+            ):
+                raise ValueError(
+                    "`video_history` shape mismatch: "
+                    f"got {tuple(history.shape)}, expected [B,C,N,H,W] with "
+                    f"batch={batch_size} and history>={num_history_frames}."
+                )
+            history = history[:, :, -num_history_frames:]
+            flat_history = history.permute(0, 2, 1, 3, 4).reshape(
+                batch_size * num_history_frames,
+                int(history.shape[1]),
+                int(history.shape[3]),
+                int(history.shape[4]),
+            )
+            flat_latents = self._encode_input_image_latents_tensor(
+                input_image=flat_history,
+                tiled=tiled,
+            )
+            if flat_latents.ndim != 5 or int(flat_latents.shape[2]) != 1:
+                raise ValueError(
+                    "Encoded history latents must be [B*N,C,1,H,W], "
+                    f"got {tuple(flat_latents.shape)}."
+                )
+            latent_channels = int(flat_latents.shape[1])
+            latent_height = int(flat_latents.shape[3])
+            latent_width = int(flat_latents.shape[4])
+            return (
+                flat_latents.reshape(
+                    batch_size,
+                    num_history_frames,
+                    latent_channels,
+                    1,
+                    latent_height,
+                    latent_width,
+                )
+                .permute(0, 2, 1, 3, 4, 5)
+                .reshape(
+                    batch_size,
+                    latent_channels,
+                    num_history_frames,
+                    latent_height,
+                    latent_width,
+                )
+            )
+        if history.ndim != 6:
             raise ValueError(
-                "`video_history` must be [B,C,N,H,W], "
+                "`video_history` must be [B,C,N,H,W] or [B,N,V,C,H,W], "
                 f"got shape {tuple(history.shape)}."
             )
         if (
             int(history.shape[0]) != batch_size
-            or int(history.shape[2]) < num_history_frames
+            or int(history.shape[1]) < num_history_frames
+            or int(history.shape[3]) != 3
         ):
             raise ValueError(
                 "`video_history` shape mismatch: "
-                f"got {tuple(history.shape)}, expected batch={batch_size}, "
-                f"history>={num_history_frames}."
+                f"got {tuple(history.shape)}, expected [B,N,V,3,H,W] with "
+                f"batch={batch_size} and history>={num_history_frames}."
             )
-        history = history[:, :, -num_history_frames:]
-        flat_history = history.permute(0, 2, 1, 3, 4).reshape(
-            batch_size * num_history_frames,
-            int(history.shape[1]),
-            int(history.shape[3]),
-            int(history.shape[4]),
-        )
-        flat_latents = self._encode_input_image_latents_tensor(
-            input_image=flat_history,
-            tiled=tiled,
-        )
-        if flat_latents.ndim != 5 or int(flat_latents.shape[2]) != 1:
-            raise ValueError(
-                "Encoded history latents must be [B*N,C,1,H,W], "
-                f"got {tuple(flat_latents.shape)}."
+        history = history[:, -num_history_frames:]
+        num_views = int(history.shape[2])
+        encoded_frames = []
+        for frame_idx in range(num_history_frames):
+            frame = history[:, frame_idx].reshape(
+                batch_size * num_views,
+                int(history.shape[3]),
+                int(history.shape[4]),
+                int(history.shape[5]),
             )
-        latent_channels = int(flat_latents.shape[1])
-        latent_height = int(flat_latents.shape[3])
-        latent_width = int(flat_latents.shape[4])
-        return (
-            flat_latents.reshape(
-                batch_size,
-                num_history_frames,
-                latent_channels,
-                1,
-                latent_height,
-                latent_width,
+            frame_latents = self._encode_input_image_latents_tensor(
+                input_image=frame,
+                tiled=tiled,
             )
-            .permute(0, 2, 1, 3, 4, 5)
-            .reshape(
-                batch_size,
-                latent_channels,
-                num_history_frames,
-                latent_height,
-                latent_width,
+            if frame_latents.ndim != 5 or int(frame_latents.shape[2]) != 1:
+                raise ValueError(
+                    "Encoded multi-view history frame latents must be "
+                    "[B*V,C,1,H,W], "
+                    f"got {tuple(frame_latents.shape)}."
+                )
+            encoded_frames.append(
+                frame_latents.squeeze(2).reshape(
+                    batch_size,
+                    num_views,
+                    int(frame_latents.shape[1]),
+                    int(frame_latents.shape[3]),
+                    int(frame_latents.shape[4]),
+                )
             )
-        )
+        return torch.stack(encoded_frames, dim=3).contiguous()
 
     def _build_history_video_frame_mask(
         self,
@@ -308,7 +349,15 @@ class AHAWAM(AHAWAMChunkBase):
                 "`chunk_proprio` is required for chunk inference conditioning."
             )
         chunk_obs_image = chunk_obs_image.to(device=self.device, dtype=self.torch_dtype)
-        if chunk_obs_image.ndim == 3:
+        if self._has_shared_visual_stem():
+            if chunk_obs_image.ndim == 4:
+                chunk_obs_image = chunk_obs_image.unsqueeze(0)
+            if chunk_obs_image.ndim != 5:
+                raise ValueError(
+                    "Shared DA3 chunk image must be [V,3,H,W] or [B,V,3,H,W], "
+                    f"got {tuple(chunk_obs_image.shape)}."
+                )
+        elif chunk_obs_image.ndim == 3:
             chunk_obs_image = chunk_obs_image.unsqueeze(0)
         self.proprio_encoder = self.proprio_encoder.to(
             device=chunk_obs_image.device,
@@ -397,8 +446,27 @@ class AHAWAM(AHAWAMChunkBase):
                 "'first_frame_causal' or 'per_frame_causal'."
             )
 
+        shared_tokens = None
+        shared_mask = None
+        multi_view_image = None
+        action_reference_image = input_image
+        if self._has_shared_visual_stem():
+            if input_image.ndim == 4:
+                input_image = input_image.unsqueeze(0)
+            if input_image.ndim != 5:
+                raise ValueError(
+                    "Shared DA3 prefill image must be [V,3,H,W] or [B,V,3,H,W], "
+                    f"got {tuple(input_image.shape)}."
+                )
+            multi_view_image = input_image
+            shared_tokens, shared_mask = self._encode_shared_visual_tokens(
+                multi_view_image
+            )
+            action_reference_image = self._compose_robotwin_multiview_video(
+                multi_view_image.unsqueeze(3)
+            )[:, :, 0]
         latents_action, batch_size = self._prepare_action_start_latents(
-            input_image=input_image,
+            input_image=action_reference_image,
             action_horizon=action_horizon,
             start_latents=None,
             seed=seed,
@@ -411,11 +479,29 @@ class AHAWAM(AHAWAMChunkBase):
             context=context,
             context_mask=context_mask,
         )
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(
-            input_image=input_image,
-            tiled=tiled,
-        )
+        if shared_tokens is not None and shared_mask is not None:
+            context = torch.cat(
+                [context, shared_tokens.to(dtype=context.dtype)], dim=1
+            )
+            context_mask = torch.cat([context_mask, shared_mask], dim=1)
+        if multi_view_image is not None:
+            batch_size, num_views, channels, height, width = multi_view_image.shape
+            flat_images = multi_view_image.reshape(
+                batch_size * num_views, channels, height, width
+            ).to(device=self.device, dtype=self.torch_dtype)
+            flat_latents = self._encode_input_image_latents_tensor(
+                input_image=flat_images,
+                tiled=tiled,
+            )
+            first_frame_latents = flat_latents.reshape(
+                batch_size, num_views, *flat_latents.shape[1:]
+            )
+        else:
+            input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+            first_frame_latents = self._encode_input_image_latents_tensor(
+                input_image=input_image,
+                tiled=tiled,
+            )
 
         fuse_flag = bool(
             getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)
@@ -479,6 +565,15 @@ class AHAWAM(AHAWAMChunkBase):
                 prefix_video_kv_cache=prefix_cache,
                 prefix_video_seq_len=prefix_seq_len,
                 video_attention_mask=video_attention_mask,
+                video_view_shape=(
+                    (
+                        int(video_pre["meta"]["grid_size"][0]),
+                        int(video_pre["meta"]["num_views"]),
+                        int(video_pre["meta"]["tokens_per_view_frame"]),
+                    )
+                    if int(video_pre["meta"].get("num_views", 1)) > 1
+                    else None
+                ),
             )
         else:
             video_kv_cache = self._prefill_action_video_cache(
@@ -497,6 +592,9 @@ class AHAWAM(AHAWAMChunkBase):
                 prior_entries = prior_entries[-num_history:]
             self._history_kv_entries = prior_entries
 
+        self._perception_version = int(
+            getattr(self, "_perception_version", 0)
+        ) + 1
         state = {
             "start_latents": latents_action,
             "context": context,
@@ -508,6 +606,9 @@ class AHAWAM(AHAWAMChunkBase):
             "video_kv_cache": video_kv_cache,
             "action_history_kv_cache": None,
             "action_history_seq_len": 0,
+            "perception_tokens": shared_tokens,
+            "perception_mask": shared_mask,
+            "perception_version": self._perception_version,
         }
         return state
 
@@ -515,6 +616,7 @@ class AHAWAM(AHAWAMChunkBase):
         """Clear accumulated history KV cache entries and frame counter."""
         self._history_kv_entries = []
         self._observed_frame_index = 0
+        self._perception_version = 0
 
     @override
     def _build_training_obs_context(
@@ -733,7 +835,10 @@ class AHAWAM(AHAWAMChunkBase):
         target_video = self.train_video_scheduler.training_target(
             input_latents, noise_video, timestep_video
         )
-        latents[:, :, 0:1] = inputs["first_frame_latents"]
+        if latents.ndim == 6:
+            latents[:, :, :, 0:1] = inputs["first_frame_latents"]
+        else:
+            latents[:, :, 0:1] = inputs["first_frame_latents"]
 
         # --- action noise (no teacher forcing) ---
         noise_action = torch.randn_like(action)
@@ -753,7 +858,9 @@ class AHAWAM(AHAWAMChunkBase):
         temporal_position_ids = self._get_main_video_temporal_position_ids(
             sample,
             batch_size=batch_size,
-            current_clip_latent_frames=int(input_latents.shape[2]),
+            current_clip_latent_frames=int(
+                input_latents.shape[3] if input_latents.ndim == 6 else input_latents.shape[2]
+            ),
         ) if num_history_frames > 0 else None
         video_pre = self.video_expert.pre_dit(
             x=latents,
@@ -899,14 +1006,27 @@ class AHAWAM(AHAWAMChunkBase):
             video_tokens_per_frame=video_tokens_per_frame,
             action_chunk_size=self.action_chunk_size,
             history_video_kv_cache=history_video_kv_cache,
+            video_view_shape=(
+                (
+                    int(video_pre["meta"]["grid_size"][0]),
+                    int(video_pre["meta"]["num_views"]),
+                    int(video_pre["meta"]["tokens_per_view_frame"]),
+                )
+                if int(video_pre["meta"].get("num_views", 1)) > 1
+                else None
+            ),
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
         pred_action_prior = self.action_expert.post_dit(
             tokens_out["action_prior"], action_pre
         )
-        pred_video = pred_video[:, :, 1:]
-        target_video_no_first = target_video[:, :, 1:]
+        if pred_video.ndim == 6:
+            pred_video = pred_video[:, :, :, 1:]
+            target_video_no_first = target_video[:, :, :, 1:]
+        else:
+            pred_video = pred_video[:, :, 1:]
+            target_video_no_first = target_video[:, :, 1:]
         loss_video_per_sample = self._compute_video_loss_per_sample(
             pred_video=pred_video,
             target_video=target_video_no_first,
@@ -924,15 +1044,26 @@ class AHAWAM(AHAWAMChunkBase):
             timestep_action=timestep_action,
             action_is_pad=action_is_pad,
         )
+        loss_repa_spatial, loss_repa_temporal = self._compute_latent_3d_repa(
+            video_tokens=tokens_out["video_repa"],
+            video_pre=video_pre,
+            inputs=inputs,
+        )
 
         loss_total = (
             self.loss_lambda_video * loss_video
             + self.loss_lambda_action_prior * loss_action_prior
+            + float(getattr(self, "loss_lambda_repa", 0.0))
+            * (loss_repa_spatial + loss_repa_temporal)
         )
         return loss_total, {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action_prior
             * float(loss_action_prior.detach().item()),
+            "loss_repa_spatial": float(getattr(self, "loss_lambda_repa", 0.0))
+            * float(loss_repa_spatial.detach().item()),
+            "loss_repa_temporal": float(getattr(self, "loss_lambda_repa", 0.0))
+            * float(loss_repa_temporal.detach().item()),
             "history_len": _history_len_metric,
         }
 
@@ -997,7 +1128,10 @@ class AHAWAM(AHAWAMChunkBase):
         target_video = self.train_video_scheduler.training_target(
             input_latents, noise_video, timestep_video
         )
-        latents[:, :, 0:1] = inputs["first_frame_latents"]
+        if latents.ndim == 6:
+            latents[:, :, :, 0:1] = inputs["first_frame_latents"]
+        else:
+            latents[:, :, 0:1] = inputs["first_frame_latents"]
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -1026,7 +1160,9 @@ class AHAWAM(AHAWAMChunkBase):
         temporal_position_ids = self._get_main_video_temporal_position_ids(
             sample,
             batch_size=batch_size,
-            current_clip_latent_frames=int(input_latents.shape[2]),
+            current_clip_latent_frames=int(
+                input_latents.shape[3] if input_latents.ndim == 6 else input_latents.shape[2]
+            ),
         ) if num_history_frames > 0 else None
         video_pre = self.video_expert.pre_dit(
             x=latents,
@@ -1169,14 +1305,27 @@ class AHAWAM(AHAWAMChunkBase):
             video_tokens_per_frame=video_tokens_per_frame,
             action_chunk_size=self.action_chunk_size,
             history_video_kv_cache=history_video_kv_cache,
+            video_view_shape=(
+                (
+                    int(video_pre["meta"]["grid_size"][0]),
+                    int(video_pre["meta"]["num_views"]),
+                    int(video_pre["meta"]["tokens_per_view_frame"]),
+                )
+                if int(video_pre["meta"].get("num_views", 1)) > 1
+                else None
+            ),
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
         pred_action_prior = self.action_expert.post_dit(
             tokens_out["action_prior"], action_pre
         )
-        pred_video = pred_video[:, :, 1:]
-        target_video_no_first = target_video[:, :, 1:]
+        if pred_video.ndim == 6:
+            pred_video = pred_video[:, :, :, 1:]
+            target_video_no_first = target_video[:, :, :, 1:]
+        else:
+            pred_video = pred_video[:, :, 1:]
+            target_video_no_first = target_video[:, :, 1:]
         loss_video_per_sample = self._compute_video_loss_per_sample(
             pred_video=pred_video,
             target_video=target_video_no_first,
@@ -1194,15 +1343,26 @@ class AHAWAM(AHAWAMChunkBase):
             timestep_action=timestep_action,
             action_is_pad=action_is_pad,
         )
+        loss_repa_spatial, loss_repa_temporal = self._compute_latent_3d_repa(
+            video_tokens=tokens_out["video_repa"],
+            video_pre=video_pre,
+            inputs=inputs,
+        )
 
         loss_total = (
             self.loss_lambda_video * loss_video
             + self.loss_lambda_action_prior * loss_action_prior
+            + float(getattr(self, "loss_lambda_repa", 0.0))
+            * (loss_repa_spatial + loss_repa_temporal)
         )
         return loss_total, {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action_prior
             * float(loss_action_prior.detach().item()),
+            "loss_repa_spatial": float(getattr(self, "loss_lambda_repa", 0.0))
+            * float(loss_repa_spatial.detach().item()),
+            "loss_repa_temporal": float(getattr(self, "loss_lambda_repa", 0.0))
+            * float(loss_repa_temporal.detach().item()),
             "history_len": _history_len_metric,
             "mean_offset": float(offsets.float().mean().item()),
         }
@@ -1294,9 +1454,31 @@ class AHAWAM(AHAWAMChunkBase):
         history = video_history.to(device=self.device, dtype=self.torch_dtype)
         if history.ndim == 4:
             history = history.unsqueeze(0)
-        if history.ndim != 5:
+        elif (
+            history.ndim == 5
+            and self._has_shared_visual_stem()
+            and int(history.shape[2]) == 3
+        ):
+            history = history.unsqueeze(0)
+        if history.ndim == 6:
+            if int(history.shape[3]) != 3:
+                raise ValueError(
+                    "Multi-view `video_history` must be [B,N,V,3,H,W], "
+                    f"got shape {tuple(history.shape)}."
+                )
+            history = history.permute(0, 2, 3, 1, 4, 5).contiguous()
+            history_time_dim = 3
+        elif history.ndim == 5:
+            if int(history.shape[1]) != 3:
+                raise ValueError(
+                    "Single-view `video_history` must be [B,3,N,H,W], "
+                    f"got shape {tuple(history.shape)}."
+                )
+            history_time_dim = 2
+        else:
             raise ValueError(
-                "`video_history` must be [C,N,H,W] or [B,C,N,H,W], "
+                "`video_history` must be [3,N,H,W], [B,3,N,H,W], "
+                "[N,V,3,H,W], or [B,N,V,3,H,W], "
                 f"got shape {tuple(history.shape)}."
             )
         if int(history.shape[0]) != batch_size:
@@ -1321,13 +1503,17 @@ class AHAWAM(AHAWAMChunkBase):
                 "`video_history_valid_len` must be scalar or [B], "
                 f"got shape {tuple(valid_len.shape)}."
             )
-        if valid_len_value < 0 or valid_len_value > int(history.shape[2]):
+        if valid_len_value < 0 or valid_len_value > int(
+            history.shape[history_time_dim]
+        ):
             raise ValueError(
                 "`video_history_valid_len` out of range: "
                 f"{valid_len_value} for history shape {tuple(history.shape)}."
             )
         if valid_len_value == 0:
             return None
+        if history.ndim == 6:
+            return history[:, :, :, -valid_len_value:]
         return history[:, :, -valid_len_value:]
 
     def _normalize_eval_history_frame_indices(
@@ -1484,11 +1670,10 @@ class AHAWAM(AHAWAMChunkBase):
         video_history = sample.get("video_history")
         if video_history is None:
             return kwargs
-        if video_history.ndim == 5:
-            video_history = video_history[0]
-        if video_history.ndim != 4:
+        if video_history.ndim not in (4, 5, 6):
             raise ValueError(
-                "`sample['video_history']` must be [B,C,N,H,W] or [C,N,H,W], "
+                "`sample['video_history']` must be [3,N,H,W], [B,3,N,H,W], "
+                "[N,V,3,H,W], or [B,N,V,3,H,W], "
                 f"got shape {tuple(video_history.shape)}."
             )
         kwargs["video_history"] = video_history
@@ -1534,13 +1719,22 @@ class AHAWAM(AHAWAMChunkBase):
         self._inference_state = None
         self.reset_history()
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4:
-            raise ValueError(
-                "`input_image` must be [3,H,W] or [B,3,H,W], "
-                f"got shape {tuple(input_image.shape)}."
-            )
+        if self._has_shared_visual_stem():
+            if input_image.ndim == 4:
+                input_image = input_image.unsqueeze(0)
+            if input_image.ndim != 5 or input_image.shape[2] != 3:
+                raise ValueError(
+                    "Shared DA3 `input_image` must be [V,3,H,W] or "
+                    f"[B,V,3,H,W], got {tuple(input_image.shape)}."
+                )
+        else:
+            if input_image.ndim == 3:
+                input_image = input_image.unsqueeze(0)
+            if input_image.ndim != 4:
+                raise ValueError(
+                    "`input_image` must be [3,H,W] or [B,3,H,W], "
+                    f"got shape {tuple(input_image.shape)}."
+                )
         batch_size = int(input_image.shape[0])
         history = self._normalize_eval_video_history(
             video_history=video_history,
@@ -1563,10 +1757,18 @@ class AHAWAM(AHAWAMChunkBase):
                     "`video_history_frame_indices` is required when `video_history` "
                     "is passed for sample-global RoPE validation."
                 )
-            for frame_idx in range(int(history.shape[2])):
+            history_num_frames = int(
+                history.shape[3] if history.ndim == 6 else history.shape[2]
+            )
+            for frame_idx in range(history_num_frames):
+                history_image = (
+                    history[:, :, :, frame_idx]
+                    if history.ndim == 6
+                    else history[:, :, frame_idx]
+                )
                 self.infer_action(
                     prompt=prompt,
-                    input_image=history[:, :, frame_idx],
+                    input_image=history_image,
                     action_horizon=action_horizon,
                     context=context,
                     context_mask=context_mask,
@@ -1685,7 +1887,11 @@ class AHAWAM(AHAWAMChunkBase):
             self._get_main_video_temporal_position_ids(
                 sample,
                 batch_size=batch_size,
-                current_clip_latent_frames=int(input_latents.shape[2]),
+                current_clip_latent_frames=int(
+                    input_latents.shape[3]
+                    if input_latents.ndim == 6
+                    else input_latents.shape[2]
+                ),
             )
             if num_history_frames > 0
             else None
@@ -1701,7 +1907,9 @@ class AHAWAM(AHAWAMChunkBase):
             action=None,
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
             temporal_position_ids=temporal_position_ids,
-            clean_prefix_frames=int(input_latents.shape[2]),
+            clean_prefix_frames=int(
+                input_latents.shape[3] if input_latents.ndim == 6 else input_latents.shape[2]
+            ),
         )
         video_tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
 

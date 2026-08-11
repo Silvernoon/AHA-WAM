@@ -161,12 +161,20 @@ Sync request:
     "type": "infer",
     "instruction": "your task instruction",
     "state": np.ndarray,          # shape [14]
-    "images": {"front": image},  # uint8 HxWx3 RGB
+    "images": {
+        "cam_high": head_image,
+        "cam_left_wrist": left_wrist_image,
+        "cam_right_wrist": right_wrist_image,
+    },  # synchronized uint8 HxWx3 RGB
 }
 ```
 
+DA3 shared-stem checkpoints require all three synchronized views in the fixed
+order shown above. Legacy single-view checkpoints continue to accept
+`{"images": {"front": image}}`.
+
 Async mode additionally supports:
 
-- `{"type": "image", "images": {"front": image}}`
-- `{"type": "action_request", "state": state, "images": {"front": image}}`
+- `{"type": "image", "images": synchronized_three_view_dict}`
+- `{"type": "action_request", "state": state, "images": synchronized_three_view_dict}`
 - `{"type": "reset", "instruction": "..."}`

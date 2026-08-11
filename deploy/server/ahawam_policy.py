@@ -200,22 +200,41 @@ class AHAWAMPolicy:
         logger.info("Instruction set: %r", instruction)
 
     def update_observation_window(self, img_arr, state):
-        """Buffer one front-camera observation and 14-D state vector."""
-        front_img = np.asarray(img_arr[0])
-        if front_img.shape[:2] != (self.video_height, self.video_width):
-            pil_img = Image.fromarray(front_img.astype(np.uint8), mode="RGB")
-            pil_img = pil_img.resize((self.video_width, self.video_height), resample=Image.BILINEAR)
-            front_img = np.asarray(pil_img, dtype=np.uint8)
+        """Buffer one synchronized camera set and robot state vector."""
+        has_shared_stem = getattr(self.model, "_has_shared_visual_stem", None)
+        requires_multiview = bool(
+            callable(has_shared_stem) and has_shared_stem()
+        )
+        expected_views = 3 if requires_multiview else 1
+        if len(img_arr) != expected_views:
+            raise ValueError(
+                f"Expected {expected_views} synchronized camera views, got {len(img_arr)}."
+            )
 
-        image_tensor = (
-            torch.from_numpy(front_img.copy())
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(device=self.device, dtype=self.model.torch_dtype)
+        image_tensors = []
+        for image in img_arr:
+            rgb = np.asarray(image)
+            if rgb.shape[:2] != (self.video_height, self.video_width):
+                pil_img = Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+                pil_img = pil_img.resize(
+                    (self.video_width, self.video_height),
+                    resample=Image.BILINEAR,
+                )
+                rgb = np.asarray(pil_img, dtype=np.uint8)
+            image_tensors.append(
+                torch.from_numpy(rgb.copy()).permute(2, 0, 1)
+            )
+        image_tensor = torch.stack(image_tensors, dim=0).to(
+            device=self.device, dtype=self.model.torch_dtype
         )
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
+        if requires_multiview:
+            image_tensor = image_tensor.unsqueeze(0)
         state_vector = np.asarray(state, dtype=np.float32).reshape(-1)
-        self._observation = {"image_tensor": image_tensor, "state_vector": state_vector}
+        self._observation = {
+            "image_tensor": image_tensor,
+            "state_vector": state_vector,
+        }
 
     def get_action(self) -> np.ndarray:
         """Run one action chunk inference."""

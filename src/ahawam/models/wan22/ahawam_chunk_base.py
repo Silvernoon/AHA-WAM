@@ -7,6 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ahawam.utils.logging_config import get_logger
+from ahawam.models.vision import (
+    DA3VisualBackbone,
+    GeometryAwareCrossViewAttention,
+    SharedGeometricTokenResampler,
+    Latent3DRelationAlignment,
+)
 
 from .base_wam import BaseWAM
 
@@ -421,6 +427,284 @@ class AHAWAMChunkBase(BaseWAM):
             use_delta_gate=True,
         )
 
+    def configure_shared_visual_stem(
+        self,
+        *,
+        model_id: str,
+        revision: Optional[str] = None,
+        input_size: tuple[int, int] = (238, 322),
+        feature_dim: int = 1536,
+        hidden_dim: int = 1024,
+        num_queries: int = 32,
+        num_views: int = 3,
+        resampler_layers: int = 2,
+        video_cross_view_layers: tuple[int, ...] | list[int] = (7, 15, 23),
+        repa_lambda: float = 0.5,
+        repa_relation_dim: int = 512,
+        repa_spatial_anchors: int = 64,
+        repa_temporal_anchors: int = 128,
+        use_camera_encoder: bool = False,
+        use_geo_rope: bool = False,
+    ) -> None:
+        """Configure one frozen DA3 stem shared by world and action conditioning."""
+        self.shared_visual_backbone = DA3VisualBackbone(
+            model_id=model_id,
+            revision=revision,
+            input_size=input_size,
+            use_camera_encoder=use_camera_encoder,
+            frozen=True,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        self.shared_cross_view_attention = GeometryAwareCrossViewAttention(
+            hidden_dim=int(feature_dim),
+            num_heads=12,
+            head_dim=128,
+            use_geo_rope=use_geo_rope,
+        ).to(device=self.device, dtype=self.torch_dtype)
+        self.shared_visual_resampler = SharedGeometricTokenResampler(
+            input_dim=int(feature_dim),
+            output_dim=self.text_dim,
+            hidden_dim=int(hidden_dim),
+            num_queries=int(num_queries),
+            num_heads=16,
+            num_layers=int(resampler_layers),
+            ffn_dim=int(hidden_dim) * 4,
+            num_views=int(num_views),
+        ).to(device=self.device, dtype=self.torch_dtype)
+        self.mot.configure_video_cross_view_attention(
+            layer_indices=[int(idx) for idx in video_cross_view_layers],
+            hidden_dim=int(self.video_expert.hidden_dim),
+            use_geo_rope=False,
+        )
+        self.latent_3d_repa = Latent3DRelationAlignment(
+            video_dim=int(self.video_expert.hidden_dim),
+            teacher_dim=int(feature_dim),
+            relation_dim=int(repa_relation_dim),
+            spatial_anchors=int(repa_spatial_anchors),
+            temporal_anchors=int(repa_temporal_anchors),
+        ).to(device=self.device, dtype=self.torch_dtype)
+        self.loss_lambda_repa = float(repa_lambda)
+        self.shared_visual_use_geo_rope = bool(use_geo_rope)
+        self.shared_visual_num_queries = int(num_queries)
+        self.action_obs_visual_proj.requires_grad_(False)
+
+    def _has_shared_visual_stem(self) -> bool:
+        return getattr(self, "shared_visual_backbone", None) is not None
+
+    def _encode_shared_visual_tokens(
+        self,
+        images: torch.Tensor,
+        *,
+        intrinsics: Optional[torch.Tensor] = None,
+        extrinsics: Optional[torch.Tensor] = None,
+        return_features: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._has_shared_visual_stem():
+            raise ValueError("Shared visual stem is not configured.")
+        if images.ndim == 5:
+            images = images.unsqueeze(1)
+            squeeze_chunk = True
+        elif images.ndim == 6:
+            squeeze_chunk = False
+        else:
+            raise ValueError(
+                "Shared visual images must be [B,V,3,H,W] or [B,N,V,3,H,W], "
+                f"got {tuple(images.shape)}."
+            )
+        batch_size, num_chunks, num_views, channels, height, width = images.shape
+        if channels != 3:
+            raise ValueError(f"Shared visual images require RGB channels, got {channels}.")
+        flat_images = images.reshape(
+            batch_size * num_chunks, num_views, channels, height, width
+        ).to(device=self.device)
+
+        def repeat_geometry(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if value is None:
+                return None
+            if value.ndim == 4:
+                value = value.unsqueeze(1).expand(
+                    batch_size, num_chunks, *value.shape[1:]
+                )
+            return value.reshape(batch_size * num_chunks, *value.shape[2:]).to(
+                device=self.device
+            )
+
+        flat_intrinsics = repeat_geometry(intrinsics)
+        flat_extrinsics = repeat_geometry(extrinsics)
+        features = self.shared_visual_backbone(
+            flat_images,
+            intrinsics=flat_intrinsics,
+            extrinsics=flat_extrinsics,
+        )
+        patch_tokens = features["patch_tokens"].to(dtype=self.torch_dtype)
+        grid = features["grid_size"]
+        grid_size = (int(grid[0].item()), int(grid[1].item()))
+        patch_tokens = self.shared_cross_view_attention(
+            patch_tokens.unsqueeze(2),
+            grid_size=grid_size,
+            image_size=tuple(int(v) for v in features["images"].shape[-2:]),
+            intrinsics=flat_intrinsics,
+            extrinsics=flat_extrinsics,
+        ).squeeze(2)
+        tokens, mask = self.shared_visual_resampler(patch_tokens)
+        tokens = tokens.reshape(batch_size, num_chunks, *tokens.shape[1:])
+        mask = mask.reshape(batch_size, num_chunks, *mask.shape[1:])
+        patch_tokens = patch_tokens.reshape(
+            batch_size, num_chunks, *patch_tokens.shape[1:]
+        )
+        if squeeze_chunk:
+            if return_features:
+                return tokens[:, 0], mask[:, 0], patch_tokens[:, 0], grid_size
+            return tokens[:, 0], mask[:, 0]
+        if return_features:
+            return tokens, mask, patch_tokens, grid_size
+        return tokens, mask
+
+    @staticmethod
+    def _compose_robotwin_multiview_video(video: torch.Tensor) -> torch.Tensor:
+        if (
+            video.ndim != 6
+            or video.shape[1] not in (2, 3)
+            or video.shape[2] != 3
+        ):
+            raise ValueError(
+                "RoboTwin multi-view video must be [B,V,3,T,H,W] with "
+                f"V in {{2,3}}, got {tuple(video.shape)}."
+            )
+        batch_size, num_views, channels, num_frames, height, width = video.shape
+
+        def resize_view(view: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+            flat = view.permute(0, 2, 1, 3, 4).reshape(
+                batch_size * num_frames, channels, height, width
+            )
+            flat = F.interpolate(
+                flat, size=size, mode="bilinear", align_corners=False, antialias=True
+            )
+            return flat.reshape(
+                batch_size, num_frames, channels, size[0], size[1]
+            ).permute(0, 2, 1, 3, 4)
+
+        if num_views == 2:
+            first = resize_view(video[:, 0], (192, 320))
+            second = resize_view(video[:, 1], (192, 320))
+            return torch.cat([first, second], dim=-2)
+
+        head = resize_view(video[:, 0], (256, 320))
+        left = resize_view(video[:, 1], (128, 160))
+        right = resize_view(video[:, 2], (128, 160))
+        return torch.cat([head, torch.cat([left, right], dim=-1)], dim=-2)
+
+    def _build_standard_inputs(
+        self, sample: dict[str, Any], tiled: bool = False
+    ) -> dict[str, Any]:
+        multi_view_video = (
+            sample["video"].permute(0, 2, 3, 1, 4, 5).contiguous()
+            if sample["video"].ndim == 6
+            else None
+        )
+        parent_sample = sample
+        if multi_view_video is not None:
+            parent_sample = dict(sample)
+            parent_sample["video"] = self._compose_robotwin_multiview_video(
+                multi_view_video
+            )
+            batch_size, num_views, channels, num_frames, height, width = (
+                multi_view_video.shape
+            )
+            flat_video = multi_view_video.reshape(
+                batch_size * num_views, channels, num_frames, height, width
+            )
+            flat_latents, flat_first = self._load_or_compute_video_latents(
+                flat_video, None, tiled=tiled
+            )
+            parent_sample["_precomputed_input_latents"] = flat_latents.reshape(
+                batch_size, num_views, *flat_latents.shape[1:]
+            )
+            if flat_first is not None:
+                parent_sample["_precomputed_first_frame_latents"] = flat_first.reshape(
+                    batch_size, num_views, *flat_first.shape[1:]
+                )
+        inputs = super()._build_standard_inputs(parent_sample, tiled=tiled)
+        if self._has_shared_visual_stem():
+            if multi_view_video is None:
+                raise ValueError(
+                    "Shared DA3 visual stem requires video [B,V,3,T,H,W]. "
+                    "Enable `preserve_camera_views` in the dataset."
+                )
+            views_by_time = multi_view_video.permute(0, 3, 1, 2, 4, 5)
+            shared_tokens, shared_mask, teacher_tokens, teacher_grid = (
+                self._encode_shared_visual_tokens(
+                    views_by_time,
+                    intrinsics=sample.get("camera_intrinsics"),
+                    extrinsics=sample.get("camera_extrinsics"),
+                    return_features=True,
+                )
+            )
+            inputs["context"] = torch.cat(
+                [inputs["context"], shared_tokens[:, 0].to(inputs["context"].dtype)],
+                dim=1,
+            )
+            inputs["context_mask"] = torch.cat(
+                [inputs["context_mask"], shared_mask[:, 0]], dim=1
+            )
+            inputs["multi_view_video"] = multi_view_video
+            inputs["shared_tokens_by_time"] = shared_tokens
+            inputs["shared_mask_by_time"] = shared_mask
+            temporal_factor = int(self.vae.temporal_downsample_factor)
+            inputs["da3_teacher_tokens"] = teacher_tokens[:, ::temporal_factor]
+            inputs["da3_teacher_grid_size"] = teacher_grid
+            self._current_shared_tokens_by_time = shared_tokens
+            self._current_shared_mask_by_time = shared_mask
+        return inputs
+
+    def _compute_latent_3d_repa(
+        self,
+        *,
+        video_tokens: torch.Tensor,
+        video_pre: dict[str, Any],
+        inputs: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._has_shared_visual_stem():
+            zero = video_tokens.new_zeros((), dtype=torch.float32)
+            return zero, zero
+        teacher_tokens = inputs.get("da3_teacher_tokens")
+        teacher_grid_size = inputs.get("da3_teacher_grid_size")
+        if teacher_tokens is None or teacher_grid_size is None:
+            raise ValueError("DA3 teacher tokens are required for Latent 3D-REPA.")
+        f, h, w = video_pre["meta"]["grid_size"]
+        num_views = int(video_pre["meta"].get("num_views", 1))
+        if num_views <= 1:
+            raise ValueError("Latent 3D-REPA requires explicit multi-view VideoDiT tokens.")
+        tokens_per_view_frame = int(video_pre["meta"]["tokens_per_view_frame"])
+        if tokens_per_view_frame != int(h * w):
+            raise ValueError("VideoDiT REPA spatial token layout mismatch.")
+        video_tokens = video_tokens.reshape(
+            video_tokens.shape[0],
+            f,
+            num_views,
+            tokens_per_view_frame,
+            video_tokens.shape[-1],
+        ).reshape(video_tokens.shape[0], f, num_views, h, w, video_tokens.shape[-1])
+        teacher_h, teacher_w = teacher_grid_size
+        if int(teacher_tokens.shape[1]) != int(f):
+            raise ValueError(
+                "DA3/VideoDiT temporal alignment mismatch: "
+                f"{teacher_tokens.shape[1]} vs {f}."
+            )
+        teacher_tokens = teacher_tokens.reshape(
+            teacher_tokens.shape[0],
+            f,
+            num_views,
+            int(teacher_h),
+            int(teacher_w),
+            teacher_tokens.shape[-1],
+        )
+        return self.latent_3d_repa(
+            video_tokens=video_tokens,
+            teacher_tokens=teacher_tokens,
+            teacher_grid_size=(int(teacher_h), int(teacher_w)),
+            video_grid_size=(int(h), int(w)),
+        )
+
     def get_additional_trainable_modules(self) -> dict[str, nn.Module]:
         modules: dict[str, nn.Module] = {}
         parent_getter = getattr(super(), "get_additional_trainable_modules", None)
@@ -438,7 +722,12 @@ class AHAWAMChunkBase(BaseWAM):
             raise ValueError(
                 "`action_obs_visual_proj` must be initialized via `configure_chunk_obs_context()`."
             )
-        modules["action_obs_visual_proj"] = action_obs_visual_proj
+        if not self._has_shared_visual_stem():
+            modules["action_obs_visual_proj"] = action_obs_visual_proj
+        else:
+            modules["shared_cross_view_attention"] = self.shared_cross_view_attention
+            modules["shared_visual_resampler"] = self.shared_visual_resampler
+            modules["latent_3d_repa"] = self.latent_3d_repa
         modules["chunk_obs_query_encoder"] = self.chunk_obs_query_encoder
         return modules
 
@@ -608,6 +897,39 @@ class AHAWAMChunkBase(BaseWAM):
             raise ValueError(
                 "`action_obs_visual_proj` must be initialized for required obs context."
             )
+        if self._has_shared_visual_stem():
+            video = video.permute(0, 2, 3, 1, 4, 5).contiguous()
+            if video.ndim != 6:
+                raise ValueError(
+                    "Shared DA3 video must be [B,V,3,T,H,W], "
+                    f"got {tuple(video.shape)}."
+                )
+            batch_size, _, channels, num_video_frames, _, _ = video.shape
+            if channels != 3:
+                raise ValueError(
+                    f"Shared DA3 video channel dimension must be 3, got {channels}."
+                )
+            chunk_indices = self._compute_chunk_obs_video_indices(
+                action_horizon=action_horizon,
+                num_video_frames=num_video_frames,
+            ).to(device=video.device)
+            cached_tokens = getattr(self, "_current_shared_tokens_by_time", None)
+            cached_mask = getattr(self, "_current_shared_mask_by_time", None)
+            if (
+                cached_tokens is not None
+                and cached_mask is not None
+                and int(cached_tokens.shape[0]) == batch_size
+                and int(cached_tokens.shape[1]) == num_video_frames
+            ):
+                cached_indices = chunk_indices.to(device=cached_tokens.device)
+                return (
+                    cached_tokens.index_select(1, cached_indices),
+                    cached_mask.index_select(1, cached_indices),
+                )
+            selected_images = video.index_select(3, chunk_indices).permute(
+                0, 3, 1, 2, 4, 5
+            )
+            return self._encode_shared_visual_tokens(selected_images)
         if video.ndim != 5:
             raise ValueError(
                 f"`video` must be 5D [B,3,T,H,W], got shape {tuple(video.shape)}"
@@ -654,6 +976,25 @@ class AHAWAMChunkBase(BaseWAM):
         if chunk_obs_images is None:
             return None
         normalized_chunk_obs_images = chunk_obs_images
+        if self._has_shared_visual_stem():
+            if normalized_chunk_obs_images.ndim == 5:
+                if batch_size != 1:
+                    raise ValueError(
+                        "Unbatched multi-view chunk images require batch_size=1."
+                    )
+                normalized_chunk_obs_images = normalized_chunk_obs_images.unsqueeze(0)
+            expected_num_chunks = action_horizon // self.action_chunk_size
+            if (
+                normalized_chunk_obs_images.ndim != 6
+                or normalized_chunk_obs_images.shape[0] != batch_size
+                or normalized_chunk_obs_images.shape[1] != expected_num_chunks
+                or normalized_chunk_obs_images.shape[3] != 3
+            ):
+                raise ValueError(
+                    "Shared DA3 chunk images must be [B,N,V,3,H,W], "
+                    f"got {tuple(normalized_chunk_obs_images.shape)}."
+                )
+            return normalized_chunk_obs_images
         if normalized_chunk_obs_images.ndim == 4:
             if batch_size != 1:
                 raise ValueError(
@@ -692,6 +1033,13 @@ class AHAWAMChunkBase(BaseWAM):
             raise ValueError(
                 "`action_obs_visual_proj` must be initialized for required obs context."
             )
+        if self._has_shared_visual_stem():
+            if chunk_obs_images.ndim != 6:
+                raise ValueError(
+                    "Shared DA3 chunk images must be [B,N,V,3,H,W], "
+                    f"got {tuple(chunk_obs_images.shape)}."
+                )
+            return self._encode_shared_visual_tokens(chunk_obs_images)
         batch_size, num_chunks, channels, height, width = chunk_obs_images.shape
         if channels != 3:
             raise ValueError(
@@ -1265,13 +1613,26 @@ class AHAWAMChunkBase(BaseWAM):
 
         batch_size = int(inference_state["batch_size"])
         chunk_obs_image = chunk_obs_image.to(device=self.device, dtype=self.torch_dtype)
-        if chunk_obs_image.ndim == 3:
-            chunk_obs_image = chunk_obs_image.unsqueeze(0)
-        if chunk_obs_image.ndim != 4 or chunk_obs_image.shape[0] != batch_size:
-            raise ValueError(
-                f"`chunk_obs_image` must be [3,H,W] or [{batch_size},3,H,W], "
-                f"got shape {tuple(chunk_obs_image.shape)}"
-            )
+        if self._has_shared_visual_stem():
+            if chunk_obs_image.ndim == 4:
+                chunk_obs_image = chunk_obs_image.unsqueeze(0)
+            if (
+                chunk_obs_image.ndim != 5
+                or chunk_obs_image.shape[0] != batch_size
+                or chunk_obs_image.shape[2] != 3
+            ):
+                raise ValueError(
+                    "`chunk_obs_image` must be [V,3,H,W] or "
+                    f"[{batch_size},V,3,H,W], got {tuple(chunk_obs_image.shape)}"
+                )
+        else:
+            if chunk_obs_image.ndim == 3:
+                chunk_obs_image = chunk_obs_image.unsqueeze(0)
+            if chunk_obs_image.ndim != 4 or chunk_obs_image.shape[0] != batch_size:
+                raise ValueError(
+                    f"`chunk_obs_image` must be [3,H,W] or [{batch_size},3,H,W], "
+                    f"got shape {tuple(chunk_obs_image.shape)}"
+                )
         if self.proprio_encoder is None:
             raise ValueError(
                 f"{type(self).__name__} requires `proprio_encoder` for chunk inference."
@@ -1742,17 +2103,36 @@ class AHAWAMChunkBase(BaseWAM):
         sample: dict[str, Any],
         eval_num_inference_steps: int,
     ) -> dict[str, Any]:
+        multi_view_batch = (
+            sample["video"].permute(0, 2, 3, 1, 4, 5).contiguous()
+            if sample["video"].ndim == 6
+            else None
+        )
+        eval_sample = sample
+        if multi_view_batch is not None:
+            eval_sample = dict(sample)
+            eval_sample["video"] = self._compose_robotwin_multiview_video(
+                multi_view_batch
+            )
         kwargs = super()._build_eval_infer_kwargs(
-            sample=sample,
+            sample=eval_sample,
             eval_num_inference_steps=eval_num_inference_steps,
         )
-        video0 = sample["video"][0]
-        _, num_frames, _, _ = video0.shape
+        video0 = (
+            multi_view_batch[0]
+            if multi_view_batch is not None
+            else sample["video"][0]
+        )
+        if multi_view_batch is not None:
+            kwargs["input_image"] = video0[:, :, 0].unsqueeze(0)
+            num_frames = int(video0.shape[2])
+        else:
+            _, num_frames, _, _ = video0.shape
         action_horizon = int(kwargs.get("action_horizon", self.action_horizon))
 
         sample_chunk_obs_images = sample.get("chunk_obs_images")
         if sample_chunk_obs_images is not None:
-            if sample_chunk_obs_images.ndim == 5:
+            if sample_chunk_obs_images.ndim in (5, 6):
                 chunk_obs_images = sample_chunk_obs_images[0]
             else:
                 chunk_obs_images = sample_chunk_obs_images
@@ -1762,7 +2142,12 @@ class AHAWAMChunkBase(BaseWAM):
                 action_horizon=action_horizon,
                 num_video_frames=num_frames,
             )
-            chunk_obs_images = video0[:, chunk_obs_indices].permute(1, 0, 2, 3)
+            if video0.ndim == 5:
+                chunk_obs_images = video0.index_select(2, chunk_obs_indices).permute(
+                    2, 0, 1, 3, 4
+                )
+            else:
+                chunk_obs_images = video0[:, chunk_obs_indices].permute(1, 0, 2, 3)
             kwargs["chunk_obs_images"] = chunk_obs_images
 
         if self.proprio_encoder is not None:
@@ -1771,7 +2156,9 @@ class AHAWAMChunkBase(BaseWAM):
                     "`sample['proprio']` is required for AHAWAMChunkBase evaluation when `proprio_dim` is enabled."
                 )
             chunk_start_proprio = self._extract_chunk_start_proprio(
-                sample["proprio"][0:1].to(device=self.device, dtype=self.torch_dtype),
+                sample["proprio"][0:1].to(
+                    device=self.device, dtype=self.torch_dtype
+                ),
                 action_horizon,
             )
             kwargs["proprio"] = chunk_start_proprio.detach().cpu()
@@ -1792,6 +2179,14 @@ class AHAWAMChunkBase(BaseWAM):
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
         payload["action_obs_visual_proj"] = action_obs_visual_proj.state_dict()
         payload["chunk_obs_query_encoder"] = self.chunk_obs_query_encoder.state_dict()
+        if self._has_shared_visual_stem():
+            payload["shared_cross_view_attention"] = (
+                self.shared_cross_view_attention.state_dict()
+            )
+            payload["shared_visual_resampler"] = (
+                self.shared_visual_resampler.state_dict()
+            )
+            payload["latent_3d_repa"] = self.latent_3d_repa.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1914,6 +2309,52 @@ class AHAWAMChunkBase(BaseWAM):
                 "Checkpoint has no `chunk_obs_query_encoder` weights; "
                 "keeping current randomly initialized `chunk_obs_query_encoder` params."
             )
+
+        if self._has_shared_visual_stem():
+            for key, module in (
+                ("shared_cross_view_attention", self.shared_cross_view_attention),
+                ("shared_visual_resampler", self.shared_visual_resampler),
+                ("latent_3d_repa", self.latent_3d_repa),
+            ):
+                if key in payload:
+                    state = payload[key]
+                    if key == "shared_visual_resampler":
+                        state = dict(state)
+                        source_embedding = state.get("view_embedding")
+                        target_embedding = module.state_dict().get("view_embedding")
+                        if (
+                            source_embedding is not None
+                            and target_embedding is not None
+                            and source_embedding.shape != target_embedding.shape
+                        ):
+                            if (
+                                source_embedding.ndim != 2
+                                or target_embedding.ndim != 2
+                                or source_embedding.shape[1] != target_embedding.shape[1]
+                                or source_embedding.shape[0] < target_embedding.shape[0]
+                            ):
+                                raise ValueError(
+                                    "Cannot adapt shared visual resampler view embeddings: "
+                                    f"{tuple(source_embedding.shape)} -> "
+                                    f"{tuple(target_embedding.shape)}."
+                                )
+                            # Stereo drops the original high camera and retains the
+                            # trailing left/right wrist view embeddings.
+                            state["view_embedding"] = source_embedding[
+                                -target_embedding.shape[0] :
+                            ].clone()
+                            logger.info(
+                                "Adapted shared visual resampler view embeddings "
+                                "from %d to %d views using trailing views.",
+                                source_embedding.shape[0],
+                                target_embedding.shape[0],
+                            )
+                    module.load_state_dict(state, strict=True)
+                else:
+                    logger.warning(
+                        "Checkpoint has no `%s` weights; keeping current initialization.",
+                        key,
+                    )
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])

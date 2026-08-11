@@ -1,0 +1,40 @@
+# @package _global_
+
+# Two-view wrist-camera variant. The cameras are synchronized but move with
+# independent arms, so this is multi-view training rather than rigid stereo.
+defaults:
+  - robotwin_ahawam_da3_subset
+  - _self_
+
+model:
+  shared_visual_config:
+    num_views: 2
+
+data:
+  train:
+    shape_meta:
+      images:
+        - key: cam_left_wrist
+          raw_shape: [3, 480, 640]
+          shape: [3, 240, 320]
+        - key: cam_right_wrist
+          raw_shape: [3, 480, 640]
+          shape: [3, 240, 320]
+    processor:
+      num_output_cameras: 2
+  val:
+    shape_meta:
+      images:
+        - key: cam_left_wrist
+          raw_shape: [3, 480, 640]
+          shape: [3, 240, 320]
+        - key: cam_right_wrist
+          raw_shape: [3, 480, 640]
+          shape: [3, 240, 320]
+    processor:
+      num_output_cameras: 2
+
+output_dir: runs/robotwin_ahawam_da3_stereo_subset/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+wandb:
+  name: robotwin_ahawam_da3_stereo_subset

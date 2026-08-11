@@ -14,6 +14,40 @@ logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
 
+def select_episode_indices(
+    *,
+    total_episodes: int,
+    val_set_proportion: float,
+    is_training_set: bool,
+    seed: int,
+    max_episodes: Optional[int] = None,
+) -> list[int]:
+    if total_episodes <= 0:
+        return []
+    if not 0.0 <= val_set_proportion < 1.0:
+        raise ValueError(
+            f"`val_set_proportion` must be in [0, 1), got {val_set_proportion}."
+        )
+    episode_indices = list(range(total_episodes))
+    if val_set_proportion >= 1e-6:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(episode_indices)
+        split_idx = int(total_episodes * (1 - val_set_proportion))
+        episode_indices = (
+            episode_indices[:split_idx]
+            if is_training_set
+            else episode_indices[split_idx:]
+        )
+    if max_episodes is not None:
+        max_episodes = int(max_episodes)
+        if max_episodes <= 0:
+            raise ValueError(
+                f"`max_episodes_per_dataset` must be positive, got {max_episodes}."
+            )
+        episode_indices = episode_indices[:max_episodes]
+    return episode_indices
+
+
 class BaseLerobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -27,9 +61,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         past_obs_size: int = 0,
 
         # train vs val
-        val_set_proportion: float = 0.05, 
+        val_set_proportion: float = 0.05,
         is_training_set: bool = False,
         seed: int = 42,
+        max_episodes_per_dataset: Optional[int] = None,
 
         # sampling
         global_sample_stride: int = 1,
@@ -96,21 +131,16 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
-        episodes = {}
-        if val_set_proportion < 1e-6:
-            for meta in metas:
-                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
-        else:
-            for meta in metas:
-                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
-                # random shuffle episode indices before splitting
-                episode_indices = list(range(meta.total_episodes))
-                rng = np.random.default_rng(seed)
-                rng.shuffle(episode_indices)
-                if self.is_training_set:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
-                else:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
+        episodes = {
+            meta.repo_id: select_episode_indices(
+                total_episodes=meta.total_episodes,
+                val_set_proportion=val_set_proportion,
+                is_training_set=is_training_set,
+                seed=seed,
+                max_episodes=max_episodes_per_dataset,
+            )
+            for meta in metas
+        }
 
         self.multi_dataset = MultiLeRobotDataset(
             dataset_dirs=self.dataset_dirs,

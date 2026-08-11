@@ -1,0 +1,62 @@
+# @package _global_
+
+defaults:
+  - robotwin_ahawam_offset_ode
+  - _self_
+
+batch_size: 1
+gradient_accumulation_steps: 4
+freeze_video_dit: true
+
+model:
+  teacher:
+    model:
+      shared_visual_config:
+        enabled: true
+        model_id: /tank/test/sivn/DA3-BASE
+        revision: null
+        input_size: [238, 322]
+        feature_dim: 1536
+        hidden_dim: 1024
+        num_queries: 32
+        num_views: 3
+        resampler_layers: 2
+        video_cross_view_layers: [7, 15, 23]
+        repa_lambda: 0.5
+        repa_relation_dim: 512
+        repa_spatial_anchors: 64
+        repa_temporal_anchors: 128
+        use_camera_encoder: false
+        use_geo_rope: false
+  student:
+    model:
+      shared_visual_config:
+        enabled: true
+        model_id: /tank/test/sivn/DA3-BASE
+        revision: null
+        input_size: [238, 322]
+        feature_dim: 1536
+        hidden_dim: 1024
+        num_queries: 32
+        num_views: 3
+        resampler_layers: 2
+        video_cross_view_layers: [7, 15, 23]
+        repa_lambda: 0.5
+        repa_relation_dim: 512
+        repa_spatial_anchors: 64
+        repa_temporal_anchors: 128
+        use_camera_encoder: false
+        use_geo_rope: false
+
+data:
+  train:
+    concat_multi_camera: null
+    preserve_camera_views: true
+    max_episodes_per_dataset: 256
+  val:
+    concat_multi_camera: null
+    preserve_camera_views: true
+    max_episodes_per_dataset: 32
+
+wandb:
+  name: robotwin_ahawam_da3_offset_ode

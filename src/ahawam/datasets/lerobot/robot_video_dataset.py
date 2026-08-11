@@ -44,10 +44,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         val_set_proportion=0.05,
         is_training_set=False,
         global_sample_stride=1,
+        max_episodes_per_dataset: Optional[int] = None,
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal",  # "horizontal", "vertical", "robotwin", or None
+        preserve_camera_views: bool = False,
+        camera_intrinsics=None,
+        camera_extrinsics=None,
         override_instruction: Optional[
             str
         ] = None,  # whether to hardcode a specific instruction for all samples, for debugging
@@ -118,6 +122,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             action_size=num_frames - 1,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
+            max_episodes_per_dataset=max_episodes_per_dataset,
             global_sample_stride=global_sample_stride,
             image_sample_indices=image_sample_indices,
         )
@@ -146,6 +151,17 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
+        self.preserve_camera_views = bool(preserve_camera_views)
+        self.camera_intrinsics = (
+            None
+            if camera_intrinsics is None
+            else torch.as_tensor(camera_intrinsics, dtype=torch.float32)
+        )
+        self.camera_extrinsics = (
+            None
+            if camera_extrinsics is None
+            else torch.as_tensor(camera_extrinsics, dtype=torch.float32)
+        )
         self.override_instruction = override_instruction
         self.num_history_frames = int(num_history_frames)
         self._video_history_valid_len_cache: torch.Tensor | None = None
@@ -313,6 +329,17 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             T_video, C, H, W = video.shape
 
         video = video.view(num_cameras, T_video, C, H, W)
+        if self.preserve_camera_views:
+            flat = video.reshape(num_cameras * T_video, C, H, W)
+            flat = self.resize_transform(flat)
+            flat = self.crop_transform(flat)
+            flat = self.normalize_transform(flat)
+            _, _, out_h, out_w = flat.shape
+            return (
+                flat.reshape(num_cameras, T_video, C, out_h, out_w)
+                .permute(1, 0, 2, 3, 4)
+                .contiguous()
+            )
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
@@ -386,6 +413,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             return 0
         return int(np.random.randint(self.max_action_offset + 1))
 
+    @staticmethod
+    def _time_major_video(video: torch.Tensor) -> torch.Tensor:
+        if video.ndim == 5:
+            return video.contiguous()
+        if video.ndim == 4:
+            return video.permute(1, 0, 2, 3).contiguous()
+        raise ValueError(
+            f"Expected processed video [C,T,H,W] or [V,C,T,H,W], got {tuple(video.shape)}"
+        )
+
     def _build_chunk_obs_images(
         self,
         video: torch.Tensor,
@@ -397,8 +434,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         offset_video = self._select_sampled_video_offsets(video, offset_indices)
         no_offset_video = self._select_sampled_video_offsets(video, no_offset_indices)
         return (
-            self._process_sampled_video_tensor(offset_video).permute(1, 0, 2, 3).contiguous(),
-            self._process_sampled_video_tensor(no_offset_video).permute(1, 0, 2, 3).contiguous(),
+            self._time_major_video(self._process_sampled_video_tensor(offset_video)),
+            self._time_major_video(self._process_sampled_video_tensor(no_offset_video)),
         )
 
     def _resolve_lerobot_dataset_for_global_index(self, sample_idx: int):
@@ -473,7 +510,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             return self._history_frame_cache[cache_key].clone()
         pixel_values = self._get_single_frame_pixel_values(cache_key)
         video = self._process_sampled_video_tensor(pixel_values)
-        frame = video[:, 0].contiguous()
+        frame = video[0].contiguous() if video.ndim == 5 else video[:, 0].contiguous()
         if self._history_frame_cache_maxsize > 0:
             self._history_frame_cache[cache_key] = frame
             if len(self._history_frame_cache) > self._history_frame_cache_maxsize:
@@ -515,7 +552,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             frames.insert(0, pad_frame)
             history_frame_indices.insert(0, 0)
         return (
-            torch.stack(frames, dim=1),
+            torch.stack(frames, dim=0 if frames[0].ndim == 4 else 1),
             torch.tensor(valid_len, dtype=torch.long),
             torch.tensor(history_frame_indices, dtype=torch.long),
         )
@@ -566,19 +603,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         elif not bool(getattr(self, "_dataset_returns_sampled_video", False)):
             image_is_pad = image_is_pad[self.video_sample_indices]
         video = self._process_video_tensor(video)
+        video_time_dim = 0 if video.ndim == 5 else 1
+        num_video_frames = int(video.shape[video_time_dim])
 
         # Proxy (from lerobot):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"]  # [T-1, action_dim]
         proprio = sample["proprio"][:-1, :]  # [T-1, state_dim]， to align with action
-        if video.shape[1] <= 1:
+        if num_video_frames <= 1:
             raise ValueError(
                 f"`video` must have at least 2 frames, got shape {tuple(video.shape)}"
             )
-        if action.shape[0] % (video.shape[1] - 1) != 0:
+        if action.shape[0] % (num_video_frames - 1) != 0:
             raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {num_video_frames - 1}"
             )
 
         task = sample["instruction"]
@@ -605,6 +644,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "proprio_is_pad": sample["proprio_is_pad"],
             "_sample_idx": sample_idx,
         }
+        if self.camera_intrinsics is not None:
+            data["camera_intrinsics"] = self.camera_intrinsics.clone()
+        if self.camera_extrinsics is not None:
+            data["camera_extrinsics"] = self.camera_extrinsics.clone()
         if self._action_offset_enabled:
             data["action_offset"] = torch.tensor(action_offset, dtype=torch.long)
             data["chunk_obs_images"] = chunk_obs_images
@@ -622,7 +665,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 video_history_valid_len,
                 video_history_frame_indices,
             ) = self._build_video_history_frames(
-                sample_idx, current_frame=video[:, 0]
+                sample_idx,
+                current_frame=video[0] if video.ndim == 5 else video[:, 0],
             )
             data["video_history"] = video_history
             data["video_history_valid_len"] = video_history_valid_len

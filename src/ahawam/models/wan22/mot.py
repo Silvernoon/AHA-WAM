@@ -8,6 +8,7 @@ import torch.utils.checkpoint as torch_checkpoint
 
 from .wan_video_dit import flash_attention, modulate, rope_apply
 from ahawam.utils.logging_config import get_logger
+from ..vision import GeometryAwareCrossViewAttention
 
 logger = get_logger(__name__)
 
@@ -82,6 +83,8 @@ class LayerwiseChunkKVCacheEditor(nn.Module):
                 "`first_frame_keys` and `first_frame_values` must be [B, S, H*Dh], "
                 f"got {tuple(first_frame_keys.shape)} and {tuple(first_frame_values.shape)}"
             )
+        output_device = first_frame_keys.device
+        output_dtype = first_frame_keys.dtype
         query_proj_weight = cast(nn.LayerNorm, self.layer_query_proj[layer_idx][0]).weight
         chunk_queries = chunk_queries.to(
             device=query_proj_weight.device,
@@ -137,10 +140,10 @@ class LayerwiseChunkKVCacheEditor(nn.Module):
             updated_k = base_k + delta_k
             updated_v = base_v + delta_v
         return {
-            "k": updated_k,
-            "v": updated_v,
-            "delta_k": delta_k,
-            "delta_v": delta_v,
+            "k": updated_k.to(device=output_device, dtype=output_dtype),
+            "v": updated_v.to(device=output_device, dtype=output_dtype),
+            "delta_k": delta_k.to(device=output_device, dtype=output_dtype),
+            "delta_v": delta_v.to(device=output_device, dtype=output_dtype),
         }
 
 
@@ -205,6 +208,7 @@ class MoT(nn.Module):
             torch.zeros(2, action_expert_hidden)
         )
         self.chunk_kv_cache_editor: Optional[LayerwiseChunkKVCacheEditor] = None
+        self.video_cross_view_attention: Optional[nn.ModuleDict] = None
 
     def configure_chunk_kv_cache_editor(
         self,
@@ -215,13 +219,69 @@ class MoT(nn.Module):
         if query_dim is None:
             self.chunk_kv_cache_editor = None
             return
+        reference = next(self.mixtures["video"].parameters())
         self.chunk_kv_cache_editor = LayerwiseChunkKVCacheEditor(
             query_dim=int(query_dim),
             num_layers=self.num_layers,
             num_heads=self.num_heads,
             attn_hidden_dim=self.num_heads * self.attn_head_dim,
             use_delta_gate=use_delta_gate,
-        ).to(device=next(self.parameters()).device, dtype=next(self.parameters()).dtype)
+        ).to(device=reference.device, dtype=reference.dtype)
+
+    def configure_video_cross_view_attention(
+        self,
+        *,
+        layer_indices: list[int],
+        hidden_dim: int,
+        use_geo_rope: bool = False,
+    ) -> None:
+        invalid = [idx for idx in layer_indices if idx < 0 or idx >= self.num_layers]
+        if invalid:
+            raise ValueError(f"Invalid cross-view layer indices: {invalid}.")
+        reference = next(self.mixtures["video"].parameters())
+        self.video_cross_view_attention = nn.ModuleDict(
+            {
+                str(idx): GeometryAwareCrossViewAttention(
+                    hidden_dim=int(hidden_dim),
+                    num_heads=self.num_heads,
+                    head_dim=self.attn_head_dim,
+                    use_geo_rope=use_geo_rope,
+                )
+                for idx in layer_indices
+            }
+        ).to(device=reference.device, dtype=reference.dtype)
+
+    def _apply_video_cross_view(
+        self,
+        x: torch.Tensor,
+        *,
+        layer_idx: int,
+        video_view_shape: Optional[tuple[int, int, int]],
+    ) -> torch.Tensor:
+        modules = self.video_cross_view_attention
+        if (
+            video_view_shape is None
+            or modules is None
+            or str(layer_idx) not in modules
+        ):
+            return x
+        num_frames, num_views, tokens_per_view_frame = video_view_shape
+        expected = int(num_frames) * int(num_views) * int(tokens_per_view_frame)
+        if int(x.shape[1]) != expected:
+            raise ValueError("Video token/view layout mismatch for cross-view attention.")
+        view_tokens = x.reshape(
+            x.shape[0],
+            num_frames,
+            num_views,
+            tokens_per_view_frame,
+            x.shape[-1],
+        ).permute(0, 2, 1, 3, 4)
+        view_tokens = modules[str(layer_idx)](
+            view_tokens,
+            grid_size=(1, int(tokens_per_view_frame)),
+            image_size=(1, int(tokens_per_view_frame)),
+        )
+        return view_tokens.permute(0, 2, 1, 3, 4).reshape_as(x)
 
     @staticmethod
     def _split_modulation(block, t_mod: torch.Tensor):
@@ -400,6 +460,7 @@ class MoT(nn.Module):
         video_tokens_per_frame: int,
         action_chunk_size: int,
         history_video_kv_cache: Optional[list[dict[str, torch.Tensor]]] = None,
+        video_view_shape: Optional[tuple[int, int, int]] = None,
     ) -> dict[str, torch.Tensor]:
         editor = self.chunk_kv_cache_editor
         if editor is None:
@@ -464,6 +525,11 @@ class MoT(nn.Module):
                 mixed_slice=mixed_video,
                 context_payload=video_context_payload,
             )
+            x_video = self._apply_video_cross_view(
+                x_video,
+                layer_idx=layer_idx,
+                video_view_shape=video_view_shape,
+            )
 
             first_k = k_video[:, : int(video_tokens_per_frame)]
             first_v = v_video[:, : int(video_tokens_per_frame)]
@@ -513,7 +579,11 @@ class MoT(nn.Module):
                 context_payload=action_context_payload,
             )
 
-        return {"video": x_video, "action_prior": x_action}
+        return {
+            "video": x_video,
+            "video_repa": x_video,
+            "action_prior": x_action,
+        }
 
     def compute_cross_attn_kv(
         self,
@@ -868,6 +938,7 @@ class MoT(nn.Module):
         prefix_video_kv_cache: list[dict[str, torch.Tensor]],
         prefix_video_seq_len: int,
         video_attention_mask: torch.Tensor,
+        video_view_shape: Optional[tuple[int, int, int]] = None,
     ) -> list[dict[str, torch.Tensor]]:
         """Prefill video cache with history prefix KV prepended per layer.
 
@@ -931,6 +1002,11 @@ class MoT(nn.Module):
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
             )
+            x = self._apply_video_cross_view(
+                x,
+                layer_idx=layer_idx,
+                video_view_shape=video_view_shape,
+            )
             kv_cache.append({"k": k, "v": v})
         return kv_cache
 
@@ -941,6 +1017,7 @@ class MoT(nn.Module):
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict[str, torch.Tensor]],
         video_attention_mask: torch.Tensor,
+        video_view_shape: Optional[tuple[int, int, int]] = None,
     ) -> list[dict[str, torch.Tensor]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
@@ -1017,6 +1094,11 @@ class MoT(nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
+            )
+            x = self._apply_video_cross_view(
+                x,
+                layer_idx=layer_idx,
+                video_view_shape=video_view_shape,
             )
             kv_cache.append({"k": k, "v": v})
         return kv_cache

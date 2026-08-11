@@ -41,6 +41,11 @@ dependencies = [
   "wandb",
 ]
 
+[project.optional-dependencies]
+da3 = [
+  "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git",
+]
+
 [tool.setuptools.package-dir]
 "" = "src"
 

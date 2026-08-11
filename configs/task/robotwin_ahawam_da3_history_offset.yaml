@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - robotwin_ahawam_da3
+  - _self_
+
+model:
+  action_horizon: 80
+  action_chunk_size: 16
+  max_action_offset: 15
+  num_history_frames: 6
+  action_video_read_mode: current_only
+  video_rope_frame_stride: 1
+
+data:
+  train:
+    num_frames: 97
+    max_action_offset: 15
+    action_chunk_size: 16
+    action_horizon: 80
+  val:
+    num_frames: 97
+    max_action_offset: 15
+    action_chunk_size: 16
+    action_horizon: 80
+
+wandb:
+  name: robotwin_ahawam_da3_history_offset_eval

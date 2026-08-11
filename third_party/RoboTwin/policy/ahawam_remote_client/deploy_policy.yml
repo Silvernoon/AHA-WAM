@@ -1,0 +1,23 @@
+policy_name: ahawam_remote_client
+task_name: null
+task_config: demo_clean
+ckpt_setting: remote_step_002000
+seed: 42
+instruction_type: unseen
+eval_num_episodes: 1
+
+sim_cfg_path: null
+sim_task: robotwin_ahawam_da3
+sim_cfg_name: sim_robotwin.yaml
+mixed_precision: bf16
+device: cuda
+dataset_stats_path: null
+action_horizon: 64
+chunks_per_video_prefill: 2
+num_inference_steps: 1
+sigma_shift: null
+text_cfg_scale: 1.0
+negative_prompt: ""
+rand_device: cpu
+tiled: false
+timing_enabled: true

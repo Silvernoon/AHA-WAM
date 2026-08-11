@@ -1,0 +1,25 @@
+# @package _global_
+
+# Small deterministic RoboTwin subset for fast Y-shaped DA3 bring-up.
+defaults:
+  - robotwin_ahawam_da3
+  - _self_
+
+data:
+  train:
+    max_episodes_per_dataset: 32
+  val:
+    max_episodes_per_dataset: 8
+
+batch_size: 1
+num_workers: 4
+freeze_video_dit: true
+max_steps: 500
+log_every: 10
+save_every: 100
+eval_every: 100
+
+output_dir: runs/robotwin_ahawam_da3_subset/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+wandb:
+  name: robotwin_ahawam_da3_subset

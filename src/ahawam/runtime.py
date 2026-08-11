@@ -188,6 +188,7 @@ def create_ahawam(
     load_text_encoder: bool = True,
     proprio_dim: int | None = None,
     action_dit_config=None,
+    shared_visual_config=None,
     action_dit_pretrained_path: str | None = None,
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
@@ -217,6 +218,16 @@ def create_ahawam(
     if not isinstance(action_dit_config, dict):
         raise ValueError(
             f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}"
+        )
+    if isinstance(shared_visual_config, DictConfig):
+        shared_visual_config = OmegaConf.to_container(
+            shared_visual_config, resolve=True
+        )
+    if shared_visual_config is None:
+        shared_visual_config = {}
+    if not isinstance(shared_visual_config, dict):
+        raise ValueError(
+            f"`shared_visual_config` must resolve to a dict, got {type(shared_visual_config)}"
         )
 
     if isinstance(video_scheduler, DictConfig):
@@ -289,6 +300,13 @@ def create_ahawam(
         loss_lambda_action_prior=float(loss.get("lambda_action_prior", 1.0)),
         query_init_from_ckpt=str(loss.get("query_init_from_ckpt", "random")),
     )
+    if bool(shared_visual_config.get("enabled", False)):
+        shared_visual_kwargs = {
+            key: value
+            for key, value in shared_visual_config.items()
+            if key != "enabled"
+        }
+        model.configure_shared_visual_stem(**shared_visual_kwargs)
     model.configure_chunk_history(
         num_history_frames=int(num_history_frames),
         action_video_read_mode=str(action_video_read_mode),

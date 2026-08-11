@@ -28,6 +28,7 @@ train:
   camera_key: null
   val_set_proportion: 0.01
   is_training_set: true
+  max_episodes_per_dataset: null
   pretrained_norm_stats: path/to/dataset_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
@@ -90,6 +91,7 @@ val:
   camera_key: null
   val_set_proportion: 0.01
   is_training_set: false
+  max_episodes_per_dataset: null
   pretrained_norm_stats: path/to/dataset_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"

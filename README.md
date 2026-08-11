@@ -196,6 +196,22 @@ python scripts/preprocess_action_dit_backbone.py \
 Then set `model.action_dit_pretrained_path` in your task config or pass it as a
 Hydra override when launching training.
 
+### DA3 Shared Visual Stem
+
+The Y-shaped multi-view variant uses the Apache-2.0 `DA3-BASE` checkpoint as a
+frozen DINO backbone. Install the optional dependency and place the checkpoint
+in the task-configured directory:
+
+```bash
+pip install -e ".[da3]"
+huggingface-cli download depth-anything/DA3-BASE \
+  --local-dir /tank/test/sivn/DA3-BASE
+```
+
+`configs/task/robotwin_ahawam_da3.yaml` keeps the three RoboTwin cameras
+independent, encodes each view with Wan VAE, shares DA3 geometric tokens between
+VideoDiT and ActionDiT, and enables cross-view attention plus Latent 3D-REPA.
+
 ### Released RoboTwin Checkpoint
 
 We release the RoboTwin2.0 checkpoint trained with
@@ -381,6 +397,7 @@ Common task configs:
 ```text
 robotwin_ahawam
 robotwin_ahawam_offset
+robotwin_ahawam_da3
 robotwin_ahawam_ode
 robotwin_ahawam_offset_ode
 ```
@@ -393,6 +410,11 @@ bash scripts/train_zero1.sh 8 task=robotwin_ahawam
 
 # Offset-aware AHA-WAM training
 bash scripts/train_zero1.sh 8 task=robotwin_ahawam_offset
+
+# DA3 shared-stem multi-view training
+DIFFSYNTH_MODEL_BASE_PATH=/tank/test/sivn/wan_models \
+DIFFSYNTH_SKIP_DOWNLOAD=true \
+bash scripts/train_zero1.sh 8 task=robotwin_ahawam_da3
 
 # ODE distillation variant
 bash scripts/train_zero1.sh 8 task=robotwin_ahawam_ode

@@ -519,6 +519,109 @@ class WanVideoDiT(torch.nn.Module):
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
 
+    def _pre_dit_multiview(
+        self,
+        *,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: Optional[torch.Tensor],
+        action: Optional[torch.Tensor],
+        temporal_position_offset: int,
+        temporal_position_ids: Optional[torch.Tensor],
+        fuse_vae_embedding_in_latents: bool,
+        clean_prefix_frames: int,
+    ) -> Dict[str, Any]:
+        if x.ndim != 6:
+            raise ValueError(f"Multi-view latents must be [B,V,C,T,H,W], got {x.shape}.")
+        num_views = int(x.shape[1])
+        states = [
+            self.pre_dit(
+                x=x[:, view_idx],
+                timestep=timestep,
+                context=context,
+                context_mask=context_mask,
+                action=action,
+                temporal_position_offset=temporal_position_offset,
+                temporal_position_ids=temporal_position_ids,
+                fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+                clean_prefix_frames=clean_prefix_frames,
+            )
+            for view_idx in range(num_views)
+        ]
+        first = states[0]
+        f, h, w = first["meta"]["grid_size"]
+        tokens_per_view_frame = int(h * w)
+        batch_size = int(x.shape[0])
+
+        def merge_batch_tokens(values: list[torch.Tensor]) -> torch.Tensor:
+            value = torch.stack(values, dim=2)
+            tail = value.shape[4:]
+            return value.reshape(
+                batch_size, f, num_views, tokens_per_view_frame, *tail
+            ).reshape(batch_size, f * num_views * tokens_per_view_frame, *tail)
+
+        def split_view_tokens(value: torch.Tensor) -> torch.Tensor:
+            return value.reshape(
+                batch_size, f, tokens_per_view_frame, *value.shape[2:]
+            )
+
+        tokens = merge_batch_tokens(
+            [split_view_tokens(state["tokens"]) for state in states]
+        )
+        t = merge_batch_tokens([split_view_tokens(state["t"]) for state in states])
+        t_mod = merge_batch_tokens(
+            [split_view_tokens(state["t_mod"]) for state in states]
+        )
+        merged_context_mask = merge_batch_tokens(
+            [split_view_tokens(state["context_mask"]) for state in states]
+        )
+
+        freqs = first["freqs"]
+        if freqs.ndim == 3:
+            freqs = freqs.reshape(f, tokens_per_view_frame, *freqs.shape[1:])
+            freqs = (
+                freqs.unsqueeze(1)
+                .expand(f, num_views, tokens_per_view_frame, *freqs.shape[2:])
+                .reshape(f * num_views * tokens_per_view_frame, *freqs.shape[2:])
+            )
+        elif freqs.ndim == 4:
+            freqs = freqs.reshape(
+                batch_size, f, tokens_per_view_frame, *freqs.shape[2:]
+            )
+            freqs = (
+                freqs.unsqueeze(2)
+                .expand(
+                    batch_size,
+                    f,
+                    num_views,
+                    tokens_per_view_frame,
+                    *freqs.shape[3:],
+                )
+                .reshape(
+                    batch_size,
+                    f * num_views * tokens_per_view_frame,
+                    *freqs.shape[3:],
+                )
+            )
+        else:
+            raise ValueError(f"Unexpected VideoDiT RoPE shape: {tuple(freqs.shape)}")
+        return {
+            "tokens": tokens,
+            "freqs": freqs,
+            "t": t,
+            "t_mod": t_mod,
+            "context": first["context"],
+            "context_mask": merged_context_mask,
+            "meta": {
+                "grid_size": (f, h, w),
+                "tokens_per_frame": num_views * tokens_per_view_frame,
+                "tokens_per_view_frame": tokens_per_view_frame,
+                "num_views": num_views,
+                "batch_size": batch_size,
+            },
+        }
+
     def pre_dit(
         self,
         x: torch.Tensor,
@@ -532,6 +635,18 @@ class WanVideoDiT(torch.nn.Module):
         control_camera_latents_input: Optional[torch.Tensor] = None,
         clean_prefix_frames: int = 1,
     ) -> Dict[str, Any]:
+        if x.ndim == 6:
+            return self._pre_dit_multiview(
+                x=x,
+                timestep=timestep,
+                context=context,
+                context_mask=context_mask,
+                action=action,
+                temporal_position_offset=temporal_position_offset,
+                temporal_position_ids=temporal_position_ids,
+                fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+                clean_prefix_frames=clean_prefix_frames,
+            )
         x, timestep, context_mask = self._validate_forward_inputs(
             x=x,
             timestep=timestep,
@@ -702,9 +817,25 @@ class WanVideoDiT(torch.nn.Module):
 
     def post_dit(self, x_tokens: torch.Tensor, pre_state: Dict[str, Any]) -> torch.Tensor:
         f, h, w = pre_state["meta"]["grid_size"]
+        num_views = int(pre_state["meta"].get("num_views", 1))
         x = self.head(x_tokens, pre_state["t"])
+        if num_views == 1:
+            return self.unpatchify(x, (f, h, w))
+        batch_size = int(x.shape[0])
+        tokens_per_view_frame = int(pre_state["meta"]["tokens_per_view_frame"])
+        x = (
+            x.reshape(
+                batch_size,
+                f,
+                num_views,
+                tokens_per_view_frame,
+                x.shape[-1],
+            )
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch_size * num_views, f * tokens_per_view_frame, x.shape[-1])
+        )
         x = self.unpatchify(x, (f, h, w))
-        return x
+        return x.reshape(batch_size, num_views, *x.shape[1:])
 
     def forward(
         self,

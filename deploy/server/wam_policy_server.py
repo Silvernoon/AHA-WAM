@@ -43,6 +43,24 @@ for _path in (SRC_ROOT, REPO_ROOT):
 
 
 
+def ordered_camera_images(images, *, require_multiview):
+    head = images.get("cam_high", images.get("front"))
+    if head is None:
+        raise ValueError("request must contain images['cam_high'] or images['front']")
+    if not require_multiview:
+        return [np.asarray(head, dtype=np.uint8)]
+    left = images.get("cam_left_wrist", images.get("left_wrist"))
+    right = images.get("cam_right_wrist", images.get("right_wrist"))
+    if left is None or right is None:
+        raise ValueError(
+            "multi-view request requires cam_high/front, cam_left_wrist, and cam_right_wrist"
+        )
+    return [
+        np.asarray(head, dtype=np.uint8),
+        np.asarray(left, dtype=np.uint8),
+        np.asarray(right, dtype=np.uint8),
+    ]
+
 def import_class(module_name, class_name):
     module = importlib.import_module(module_name)
     return getattr(module, class_name)
@@ -191,9 +209,14 @@ class WAMPolicyAdapter:
     def infer(self, request):
         t0 = time.perf_counter()
         images = request.get("images", {})
-        front = images.get("front")
-        if front is None:
-            raise ValueError("request must contain images['front']")
+        shared_stem = getattr(
+            getattr(self.policy, "model", None), "_has_shared_visual_stem", None
+        )
+        img_arr = ordered_camera_images(
+            images,
+            require_multiview=bool(callable(shared_stem) and shared_stem()),
+        )
+        front = img_arr[0]
 
         state = np.asarray(request["state"], dtype=np.float32).reshape(-1)
         if state.shape[0] != self.args.action_dim:
@@ -203,15 +226,11 @@ class WAMPolicyAdapter:
         self._apply_instruction(request_instruction)
 
         logger.info(
-            "Preparing inference input: front_shape=%s front_dtype=%s state_shape=%s instruction=%r",
-            getattr(front, "shape", None),
-            getattr(front, "dtype", None),
+            "Preparing inference input: camera_shapes=%s state_shape=%s instruction=%r",
+            [tuple(image.shape) for image in img_arr],
             state.shape,
             request_instruction,
         )
-
-        # Only img_arr[0] (front/head camera) is used by the deployment model.
-        img_arr = [front]
 
         infer_t0 = time.perf_counter()
         if hasattr(self.policy, "update_observation_window"):
@@ -559,9 +578,16 @@ class AsyncPolicyBackend:
     def _handle_image(self, request):
         """Push image for async video prefill."""
         images = request.get("images", {})
-        front = images.get("front")
-        if front is None:
-            return {"ok": False, "error": "image request must contain images['front']"}
+        shared_stem = getattr(
+            getattr(self.policy, "model", None), "_has_shared_visual_stem", None
+        )
+        try:
+            img_arr = ordered_camera_images(
+                images,
+                require_multiview=bool(callable(shared_stem) and shared_stem()),
+            )
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
 
         # Start runtime on first image if not started
         if not self._async_started:
@@ -569,10 +595,10 @@ class AsyncPolicyBackend:
             self.runtime.start(prompt=prompt)
             self._async_started = True
 
-        # Preprocess image same way as adapter
-        front = np.asarray(front, dtype=np.uint8)
-        img_arr = [front]
-        self.policy.update_observation_window(img_arr, np.zeros(self.args.action_dim, dtype=np.float32))
+        # Preprocess synchronized cameras using the policy adapter.
+        self.policy.update_observation_window(
+            img_arr, np.zeros(self.args.action_dim, dtype=np.float32)
+        )
         image_tensor = self.policy._observation["image_tensor"]
 
         queued = self.runtime.push_image(image_tensor)
@@ -581,11 +607,19 @@ class AsyncPolicyBackend:
     def _handle_action_request(self, request):
         """Request an action chunk using latest video inference state."""
         images = request.get("images", {})
-        front = images.get("front")
         state = request.get("state")
-
-        if front is None or state is None:
-            return {"ok": False, "error": "action_request must contain images['front'] and state"}
+        if state is None:
+            return {"ok": False, "error": "action_request must contain state"}
+        shared_stem = getattr(
+            getattr(self.policy, "model", None), "_has_shared_visual_stem", None
+        )
+        try:
+            img_arr = ordered_camera_images(
+                images,
+                require_multiview=bool(callable(shared_stem) and shared_stem()),
+            )
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
 
         if not self._async_started:
             return {"ok": False, "error": "async runtime not started; send an image first"}
@@ -594,10 +628,8 @@ class AsyncPolicyBackend:
         if not self.runtime.first_prefill_done.wait(timeout=5.0):
             return {"ok": False, "error": "timeout waiting for first video prefill"}
 
-        # Preprocess
-        front = np.asarray(front, dtype=np.uint8)
+        # Preprocess synchronized cameras and state.
         state = np.asarray(state, dtype=np.float32).reshape(-1)
-        img_arr = [front]
         self.policy.update_observation_window(img_arr, state)
         image_tensor = self.policy._observation["image_tensor"]
         proprio = self.policy._normalize_state(state)

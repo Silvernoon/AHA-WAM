@@ -1,0 +1,34 @@
+# @package _global_
+
+defaults:
+  - robotwin_ahawam
+  - _self_
+
+model:
+  action_dit_pretrained_path: /tank/test/sivn/wan_models/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+  num_history_frames: 0
+  shared_visual_config:
+    enabled: true
+    model_id: /tank/test/sivn/DA3-BASE
+    revision: null
+    input_size: [238, 322]
+    feature_dim: 1536
+    hidden_dim: 1024
+    num_queries: 32
+    num_views: 3
+    resampler_layers: 2
+    use_camera_encoder: false
+    use_geo_rope: false
+
+data:
+  train:
+    concat_multi_camera: null
+    preserve_camera_views: true
+  val:
+    concat_multi_camera: null
+    preserve_camera_views: true
+
+init_checkpoint: /tank/test/sivn/AHA-WAM-Pretrained/AHA-WAM-pretrained.pt
+
+wandb:
+  name: robotwin_ahawam_da3
