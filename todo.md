@@ -60,6 +60,14 @@ shared=True, views=3, history=6, horizon=80, offset=15, chunk=16
 - RGB 已改为 JPEG quality 90 二进制附件协议，不再走 base64 JSON。单请求从约 `1.232 MB` 降为 header `~3.3 KB` + JPEG `~31–45 KB`；客户端编码约 `6–17 ms`，服务端接收+解码约 `0.10–0.13 s`。
 - 修正协议后 `grab_roller` seed `4300000` 完整闭环在数十秒内结束，不再超时；结果仍为 `0/1`。失败视频已下载为 `/home/sivn/Downloads/ahawam-eval-videos/grab_roller_teacher_jpeg_direct_q90_fixed_seed4300000.mp4`，SHA-256 `9addcabb438c993330271877aae940d75b9bbc417db5c35746f92b49ee68a07d`。这确认网络和控制时序问题已解除，但 Teacher 策略本身仍未成功抓取。
 
+### VideoDiT 输出审计
+
+- `step_017000` checkpoint 不保存独立 VideoDiT 权重；它只保存 `mot`（其中包含 video/action experts）、proprio、共享适配器和 REPA。训练实际 `freeze_video_dit=true`，Stage-1 和 history/offset Stage-2 均未更新 VideoDiT。
+- 训练配置同时设置 `video_attention_mask_mode=per_frame_causal`、`action_conditioned=false`。因此 VideoDiT 预测未来时完全看不到动作；它只能按文本和首帧生成一个可能未来，不能作为闭环动作是否正确的可靠 world rollout。
+- 历史训练期间 VideoDiT validation 没有成功产出：第一次因多视角 `video_history` 形状 `(1,6,3,3,384,320)` 不被旧 eval 接口支持而报错；结果目录 `eval/` 为空，没有 PSNR/SSIM 或视频证据。
+- 已在预录 episode `007479` 上生成纯 VideoDiT 10-step 输出。三列依次为 `VideoDiT prediction | VAE reconstruction | GT`。VAE 重建与 GT 平均像素绝对误差约 `1.83/255`，说明 VAE 正常；VideoDiT 与 GT 约 `25.03/255`，且预测随时间明显变暗、模糊并产生重影，预测标准差由 GT 约 `39.03` 降至约 `21.79`。
+- 输出视频：`/home/sivn/Downloads/ahawam-eval-videos/videodit_step017000_direct_pred_vae_gt.mp4`；预览：`videodit_step017000_direct_preview.png`。这表明目前 VideoDiT world rollout 质量不合格，但 action 部署只使用首帧 VideoDiT KV prefill，并不会执行该生成 rollout；闭环失败更直接指向 action 条件/训练目标/输入域，而不是 VAE。
+
 ## 优先排查项
 
 ### 1. 视觉域偏移
