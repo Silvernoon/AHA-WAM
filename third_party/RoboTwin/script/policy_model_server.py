@@ -20,11 +20,14 @@ sys.path.append("./description/utils")
 
 import numpy as np
 from typing import Any
+import io
 import base64
-import zlib
+
+from PIL import Image
 
 
-_COMPRESSED_PAYLOAD_MARKER = "__compressed_json__"
+_JPEG_PAYLOAD_MARKER = "__jpeg_binary__"
+_JPEG_IMAGE_MARKER = "__jpeg_image__"
 
 
 def _log(message):
@@ -46,6 +49,31 @@ def _recv_exact(sock, size):
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _decode_jpeg_images(value, attachments):
+    if (
+        isinstance(value, dict)
+        and set(value) == {_JPEG_IMAGE_MARKER}
+    ):
+        attachment_index = int(value[_JPEG_IMAGE_MARKER])
+        if not 0 <= attachment_index < len(attachments):
+            raise ValueError(
+                f"Invalid JPEG attachment index: {attachment_index}."
+            )
+        with Image.open(io.BytesIO(attachments[attachment_index])) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if isinstance(value, dict):
+        return {
+            key: _decode_jpeg_images(item, attachments)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _decode_jpeg_images(item, attachments)
+            for item in value
+        ]
+    return value
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -162,50 +190,42 @@ class ModelServer:
                     header_receive_s = time.perf_counter() - request_started
 
                     header_started = time.perf_counter()
-                    header = json.loads(header_payload.decode("utf-8"))
+                    header = json_to_numpy(header_payload.decode("utf-8"))
                     header_s = time.perf_counter() - header_started
                     if (
                         isinstance(header, dict)
-                        and header.get(_COMPRESSED_PAYLOAD_MARKER) is True
+                        and header.get(_JPEG_PAYLOAD_MARKER) is True
                     ):
-                        compressed_length = int.from_bytes(
-                            _recv_exact(client_socket, 4), "big"
-                        )
+                        attachment_lengths = [
+                            int(length)
+                            for length in header.get("attachment_lengths", [])
+                        ]
                         payload_receive_started = time.perf_counter()
-                        compressed = _recv_exact(client_socket, compressed_length)
+                        attachments = [
+                            _recv_exact(client_socket, length)
+                            for length in attachment_lengths
+                        ]
                         payload_receive_s = time.perf_counter() - payload_receive_started
-                        decompress_started = time.perf_counter()
-                        raw_msg = zlib.decompress(compressed).decode("utf-8")
-                        decompress_s = time.perf_counter() - decompress_started
-                        parse_started = time.perf_counter()
-                        data = json_to_numpy(raw_msg)
-                        parse_s = time.perf_counter() - parse_started
+                        decode_started = time.perf_counter()
+                        data = _decode_jpeg_images(header["data"], attachments)
+                        decode_s = time.perf_counter() - decode_started
+                        receive_s = header_receive_s + payload_receive_s
+                        deserialize_s = header_s + decode_s
                         _log(
-                            f"request compressed_bytes={compressed_length} "
-                            f"raw_bytes={len(raw_msg)} header_receive_s={header_receive_s:.3f} "
-                            f"header_s={header_s:.3f} payload_receive_s={payload_receive_s:.3f} "
-                            f"decompress_s={decompress_s:.3f} parse_s={parse_s:.3f}"
+                            f"request jpeg_bytes={sum(attachment_lengths)} "
+                            f"images={len(attachments)} "
+                            f"header_receive_s={header_receive_s:.3f} "
+                            f"payload_receive_s={payload_receive_s:.3f} "
+                            f"header_s={header_s:.3f} decode_s={decode_s:.3f}"
                         )
                     else:
-                        parse_started = time.perf_counter()
-                        data = json_to_numpy(header_payload.decode("utf-8"))
-                        parse_s = time.perf_counter() - parse_started
+                        data = header
+                        receive_s = header_receive_s
+                        deserialize_s = header_s
                         _log(
                             f"request uncompressed_bytes={msg_length} "
-                            f"receive_s={header_receive_s:.3f} parse_s={parse_s:.3f}"
+                            f"receive_s={receive_s:.3f} parse_s={deserialize_s:.3f}"
                         )
-                    receive_s = header_receive_s + (
-                        payload_receive_s
-                        if isinstance(header, dict)
-                        and header.get(_COMPRESSED_PAYLOAD_MARKER) is True
-                        else 0.0
-                    )
-                    deserialize_s = time.perf_counter() - header_started - (
-                        payload_receive_s
-                        if isinstance(header, dict)
-                        and header.get(_COMPRESSED_PAYLOAD_MARKER) is True
-                        else 0.0
-                    )
 
                     # Extract command and observation
                     cmd = data.get("cmd")

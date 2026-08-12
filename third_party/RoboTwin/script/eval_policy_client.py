@@ -49,10 +49,13 @@ import numpy as np
 import json
 from typing import Any
 import base64
-import zlib
+import io
+
+from PIL import Image
 
 
-_COMPRESSED_PAYLOAD_MARKER = "__compressed_json__"
+_JPEG_PAYLOAD_MARKER = "__jpeg_binary__"
+_JPEG_IMAGE_MARKER = "__jpeg_image__"
 
 
 def _send_exact(sock, payload):
@@ -71,6 +74,42 @@ def _recv_exact(sock, size):
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+def _encode_jpeg_images(value, attachments, quality):
+    if (
+        isinstance(value, np.ndarray)
+        and value.dtype == np.uint8
+        and value.ndim == 3
+        and value.shape[2] == 3
+    ):
+        buffer = io.BytesIO()
+        Image.fromarray(value, mode="RGB").save(
+            buffer,
+            format="JPEG",
+            quality=int(quality),
+            subsampling=0,
+            optimize=False,
+        )
+        attachment_index = len(attachments)
+        attachments.append(buffer.getvalue())
+        return {_JPEG_IMAGE_MARKER: attachment_index}
+    if isinstance(value, dict):
+        return {
+            key: _encode_jpeg_images(item, attachments, quality)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _encode_jpeg_images(item, attachments, quality)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _encode_jpeg_images(item, attachments, quality)
+            for item in value
+        ]
+    return value
+
 
 class NumpyEncoder(json.JSONEncoder):
     """Enhanced json encoder for numpy types with array reconstruction info"""
@@ -165,10 +204,15 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 class ModelClient:
-    def __init__(self, host='localhost', port=9999, timeout=30):
+    def __init__(self, host="localhost", port=9999, timeout=30, jpeg_quality=90):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.jpeg_quality = int(jpeg_quality)
+        if not 1 <= self.jpeg_quality <= 100:
+            raise ValueError(
+                f"`jpeg_quality` must be in [1,100], got {self.jpeg_quality}."
+            )
         self.sock = None
         self._connect()
 
@@ -198,26 +242,36 @@ class ModelClient:
                     )
 
     def _send_recv(self, data):
-        """Send one zlib-compressed JSON request and receive its response."""
+        """Send JSON metadata followed by raw JPEG image attachments."""
         try:
             encode_started = time.perf_counter()
-            raw_data = numpy_to_json(data).encode("utf-8")
-            payload = zlib.compress(raw_data, level=1)
-            header = json.dumps(
+            attachments = []
+            encoded_data = _encode_jpeg_images(
+                data,
+                attachments,
+                self.jpeg_quality,
+            )
+            header = numpy_to_json(
                 {
-                    _COMPRESSED_PAYLOAD_MARKER: True,
-                    "raw_bytes": len(raw_data),
+                    _JPEG_PAYLOAD_MARKER: True,
+                    "data": encoded_data,
+                    "attachment_lengths": [
+                        len(attachment) for attachment in attachments
+                    ],
                 }
             ).encode("utf-8")
+            encode_s = time.perf_counter() - encode_started
             send_started = time.perf_counter()
             _send_exact(self.sock, len(header).to_bytes(4, "big"))
             _send_exact(self.sock, header)
-            _send_exact(self.sock, len(payload).to_bytes(4, "big"))
-            _send_exact(self.sock, payload)
+            for attachment in attachments:
+                _send_exact(self.sock, attachment)
+            payload_bytes = sum(len(attachment) for attachment in attachments)
             print(
                 "[policy-client] request "
-                f"raw_bytes={len(raw_data)} compressed_bytes={len(payload)} "
-                f"encode_s={send_started - encode_started:.3f} "
+                f"header_bytes={len(header)} jpeg_bytes={payload_bytes} "
+                f"images={len(attachments)} quality={self.jpeg_quality} "
+                f"encode_s={encode_s:.3f} "
                 f"send_s={time.perf_counter() - send_started:.3f}",
                 flush=True,
             )
@@ -361,7 +415,12 @@ def main(usr_args):
     request_timeout = float(usr_args.get("request_timeout", 30))
     expert_check = bool(usr_args.get("expert_check", True))
     instruction_override = usr_args.get("instruction_override")
-    model = ModelClient(port=port, timeout=request_timeout)
+    jpeg_quality = int(usr_args.get("jpeg_quality", 90))
+    model = ModelClient(
+        port=port,
+        timeout=request_timeout,
+        jpeg_quality=jpeg_quality,
+    )
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
                                    args,

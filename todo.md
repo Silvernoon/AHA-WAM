@@ -56,6 +56,9 @@ shared=True, views=3, history=6, horizon=80, offset=15, chunk=16
 - 但 16 步 Teacher 首个远程 action 请求仍出现分钟级无 GPU 利用率的等待；将 timeout 从 180 秒提高到 900 秒后仍未形成完整结果。因此当前还有模型服务请求阻塞/推理延迟问题，不能声称已经完成修正后的闭环复测。
 - 分阶段日志已定位旧“Teacher 推理卡住”为网络传输问题：每个三相机 observation 经 base64 JSON 后约 `1.232 MB`，通过双层 SSH 转发接收耗时 `85–152 s`；真实首个 Teacher method 只需 `1.013 s`，后续 deque 命中为 `0.000 s`。GPU 低利用率是服务端在等请求字节，不是 16 步扩散卡死。
 - zlib level-1 将请求压到约 `207–308 KB`，客户端编码约 `0.018–0.021 s`，首个请求总耗时降至 `46.565 s`，后续降至约 `15–40 s`。当前链路仍受双层 SSH 的高延迟/吞吐影响，下一步应取消本地中继，改为渲染机到 A800 的单跳 TCP/SSH，或换二进制图像协议。
+- A800 已通过其自身 SSH 密钥直连公网 4090；已建立 `A800 -> 4090` 单跳反向隧道，移除本机中继。
+- RGB 已改为 JPEG quality 90 二进制附件协议，不再走 base64 JSON。单请求从约 `1.232 MB` 降为 header `~3.3 KB` + JPEG `~31–45 KB`；客户端编码约 `6–17 ms`，服务端接收+解码约 `0.10–0.13 s`。
+- 修正协议后 `grab_roller` seed `4300000` 完整闭环在数十秒内结束，不再超时；结果仍为 `0/1`。失败视频已下载为 `/home/sivn/Downloads/ahawam-eval-videos/grab_roller_teacher_jpeg_direct_q90_fixed_seed4300000.mp4`，SHA-256 `9addcabb438c993330271877aae940d75b9bbc417db5c35746f92b49ee68a07d`。这确认网络和控制时序问题已解除，但 Teacher 策略本身仍未成功抓取。
 
 ## 优先排查项
 
