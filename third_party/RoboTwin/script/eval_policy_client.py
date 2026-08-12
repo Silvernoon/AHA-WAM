@@ -343,6 +343,8 @@ def main(usr_args):
     topk = 1
 
     request_timeout = float(usr_args.get("request_timeout", 30))
+    expert_check = bool(usr_args.get("expert_check", True))
+    instruction_override = usr_args.get("instruction_override")
     model = ModelClient(port=port, timeout=request_timeout)
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -352,7 +354,9 @@ def main(usr_args):
                                    test_num=test_num,
                                    video_size=video_size,
                                    instruction_type=instruction_type,
-                                   policy_conda_env=policy_conda_env)
+                                   policy_conda_env=policy_conda_env,
+                                   expert_check=expert_check,
+                                   instruction_override=instruction_override)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -376,11 +380,13 @@ def eval_policy(task_name,
                 test_num=100,
                 video_size=None,
                 instruction_type=None,
-                policy_conda_env=None):
+                policy_conda_env=None,
+                expert_check=True,
+                instruction_override=None):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    expert_check = bool(expert_check)
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
@@ -436,9 +442,18 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if instruction_override is None:
+            if not expert_check:
+                raise ValueError(
+                    "`instruction_override` is required when `expert_check=False`."
+                )
+            episode_info_list = [episode_info["info"]]
+            results = generate_episode_descriptions(
+                args["task_name"], episode_info_list, test_num
+            )
+            instruction = np.random.choice(results[0][instruction_type])
+        else:
+            instruction = str(instruction_override)
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:

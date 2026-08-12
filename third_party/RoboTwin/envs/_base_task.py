@@ -1553,6 +1553,68 @@ class Base_Task(gym.Env):
             self.robot.get_right_gripper_val(),
         )
 
+        qpos_control_mode = os.environ.get(
+            "ROBOTWIN_QPOS_CONTROL_MODE", "topp"
+        ).strip().lower()
+        if action_type == "qpos" and qpos_control_mode == "fixed_rate":
+            control_steps = int(os.environ.get("ROBOTWIN_QPOS_CONTROL_STEPS", "5"))
+            if control_steps <= 0:
+                raise ValueError(
+                    "ROBOTWIN_QPOS_CONTROL_STEPS must be positive, "
+                    f"got {control_steps}."
+                )
+            left_current_qpos = current_jointstate[:left_arm_dim]
+            right_current_qpos = current_jointstate[
+                left_arm_dim + 1:left_arm_dim + right_arm_dim + 1
+            ]
+            left_target_qpos = left_arm_actions[0]
+            right_target_qpos = right_arm_actions[0]
+            control_duration = control_steps / 250.0
+            left_velocity = (
+                left_target_qpos - left_current_qpos
+            ) / control_duration
+            right_velocity = (
+                right_target_qpos - right_current_qpos
+            ) / control_duration
+
+            for control_idx in range(control_steps):
+                alpha = float(control_idx + 1) / float(control_steps)
+                self.robot.set_arm_joints(
+                    left_current_qpos
+                    + alpha * (left_target_qpos - left_current_qpos),
+                    left_velocity,
+                    "left",
+                )
+                self.robot.set_arm_joints(
+                    right_current_qpos
+                    + alpha * (right_target_qpos - right_current_qpos),
+                    right_velocity,
+                    "right",
+                )
+                self.robot.set_gripper(
+                    left_current_gripper
+                    + alpha * (left_gripper_actions[0] - left_current_gripper),
+                    "left",
+                )
+                self.robot.set_gripper(
+                    right_current_gripper
+                    + alpha * (right_gripper_actions[0] - right_current_gripper),
+                    "right",
+                )
+                self.scene.step()
+                self._update_render()
+                if self.check_success():
+                    self.eval_success = True
+                    self.get_obs()
+                    if self.eval_video_path is not None:
+                        eval_frame = self._get_eval_video_frame()
+                        self.eval_video_ffmpeg.stdin.write(eval_frame.tobytes())
+                    return
+
+            if self.render_freq:
+                self.viewer.render()
+            return
+
         left_gripper_path = np.hstack((left_current_gripper, left_gripper_actions))
         right_gripper_path = np.hstack((right_current_gripper, right_gripper_actions))
 

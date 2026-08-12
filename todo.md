@@ -51,6 +51,9 @@ shared=True, views=3, history=6, horizon=80, offset=15, chunk=16
 - 训练与部署 `dataset_stats.json` SHA-256 均为 `7a02c46cfc8c5e746c0afbe41fca73f723eda34cbc083f8ca54f76d8f7468095`。
 - 数据集元数据显示动作和状态均为 50 FPS、14D，顺序为左臂 7D、右臂 7D；与 RoboTwin `get_obs()` 的 `left_arm + left_gripper + right_arm + right_gripper` 顺序一致。
 - 修正后 A800 真实 checkpoint smoke 通过：输入尺寸 `384x320`、RoPE stride `8`、输出 `(14,)`、全部 finite；这只证明推理链可运行，不证明闭环成功。
+- 新 4090 渲染机 `connect.bjb3.seetacloud.com:49223` 已验证：RTX 4090、Driver `580.142`、密钥 SSH 和 `my_nvidia_icd.json` 下 SAPIEN 正常。
+- 重新闭环时确认 RoboTwin 默认仍把每个 50 FPS qpos 当作独立 TOPP 终点；单回合超过一小时仍未完成，不能作为有效控制实验。已增加可选 `ROBOTWIN_QPOS_CONTROL_MODE=fixed_rate`，用 5 个 250 Hz physics step 对应一个 50 Hz 数据动作。
+- 但 16 步 Teacher 首个远程 action 请求仍出现分钟级无 GPU 利用率的等待；将 timeout 从 180 秒提高到 900 秒后仍未形成完整结果。因此当前还有模型服务请求阻塞/推理延迟问题，不能声称已经完成修正后的闭环复测。
 
 ## 优先排查项
 
