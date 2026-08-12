@@ -49,6 +49,28 @@ import numpy as np
 import json
 from typing import Any
 import base64
+import zlib
+
+
+_COMPRESSED_PAYLOAD_MARKER = "__compressed_json__"
+
+
+def _send_exact(sock, payload):
+    sock.sendall(payload)
+
+
+def _recv_exact(sock, size):
+    chunks = []
+    remaining = int(size)
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError(
+                f"Connection closed with {remaining}/{size} bytes remaining"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 class NumpyEncoder(json.JSONEncoder):
     """Enhanced json encoder for numpy types with array reconstruction info"""
@@ -176,44 +198,38 @@ class ModelClient:
                     )
 
     def _send_recv(self, data):
-        """Send request and receive response with numpy array support"""
+        """Send one zlib-compressed JSON request and receive its response."""
         try:
-            # Serialize with numpy support
-            json_data = numpy_to_json(data).encode('utf-8')
-            
-            # Send data length and data
-            self.sock.sendall(len(json_data).to_bytes(4, 'big'))
-            self.sock.sendall(json_data)
-            
-            # Receive and deserialize response
-            response = self._recv_response()
-            return response
-            
+            encode_started = time.perf_counter()
+            raw_data = numpy_to_json(data).encode("utf-8")
+            payload = zlib.compress(raw_data, level=1)
+            header = json.dumps(
+                {
+                    _COMPRESSED_PAYLOAD_MARKER: True,
+                    "raw_bytes": len(raw_data),
+                }
+            ).encode("utf-8")
+            send_started = time.perf_counter()
+            _send_exact(self.sock, len(header).to_bytes(4, "big"))
+            _send_exact(self.sock, header)
+            _send_exact(self.sock, len(payload).to_bytes(4, "big"))
+            _send_exact(self.sock, payload)
+            print(
+                "[policy-client] request "
+                f"raw_bytes={len(raw_data)} compressed_bytes={len(payload)} "
+                f"encode_s={send_started - encode_started:.3f} "
+                f"send_s={time.perf_counter() - send_started:.3f}",
+                flush=True,
+            )
+            return self._recv_response()
         except Exception as e:
             self.close()
             raise ConnectionError(f"Communication error: {str(e)}")
 
     def _recv_response(self):
-        """Receive response with numpy array reconstruction"""
-        # Read response length
-        len_data = self.sock.recv(4)
-        if not len_data:
-            raise ConnectionError("Connection closed by server")
-        
-        size = int.from_bytes(len_data, 'big')
-        
-        # Read complete response
-        chunks = []
-        received = 0
-        while received < size:
-            chunk = self.sock.recv(min(size - received, 4096))
-            if not chunk:
-                raise ConnectionError("Incomplete response received")
-            chunks.append(chunk)
-            received += len(chunk)
-        
-        # Deserialize with numpy reconstruction
-        return json_to_numpy(b''.join(chunks).decode('utf-8'))
+        """Receive and deserialize an uncompressed response."""
+        size = int.from_bytes(_recv_exact(self.sock, 4), "big")
+        return json_to_numpy(_recv_exact(self.sock, size).decode("utf-8"))
 
     def call(self, func_name=None, obs=None):
         response = self._send_recv({"cmd": func_name, "obs": obs})

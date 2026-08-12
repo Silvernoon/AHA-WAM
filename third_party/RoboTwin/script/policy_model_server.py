@@ -21,6 +21,31 @@ sys.path.append("./description/utils")
 import numpy as np
 from typing import Any
 import base64
+import zlib
+
+
+_COMPRESSED_PAYLOAD_MARKER = "__compressed_json__"
+
+
+def _log(message):
+    print(
+        f"[{datetime.now().isoformat(timespec='milliseconds')}] {message}",
+        flush=True,
+    )
+
+
+def _recv_exact(sock, size):
+    chunks = []
+    remaining = int(size)
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError(
+                f"Connection closed with {remaining}/{size} bytes remaining"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -88,8 +113,8 @@ class ModelServer:
         self.server_socket.listen(5)
         self.running = True
 
-        print(f"🚀 Model server started on {self.host}:{self.port}")
-        print("🔄 Server is waiting for client connections...")
+        _log(f"Model server started on {self.host}:{self.port}")
+        _log("Server is waiting for client connections")
 
         self._accept_connections()
 
@@ -103,14 +128,14 @@ class ModelServer:
                 pass
         for t in self.client_threads:
             t.join(timeout=1)
-        print("🛑 Server has been stopped")
+        _log("Server has been stopped")
 
     def _accept_connections(self):
         """Accept and handle new client connections"""
         while self.running:
             try:
                 client_socket, addr = self.server_socket.accept()
-                print(f"✅ Client connected from {addr}")
+                _log(f"Client connected from {addr}")
                 # Handle each client in a separate thread
                 t = threading.Thread(target=self._handle_client,
                                      args=(client_socket,), daemon=True)
@@ -120,7 +145,7 @@ class ModelServer:
                 continue
             except Exception as e:
                 if self.running:
-                    print(f"⚠️ Error accepting connection: {e}")
+                    _log(f"Error accepting connection: {e}")
                 break
 
     def _handle_client(self, client_socket):
@@ -129,25 +154,58 @@ class ModelServer:
             while self.running:
                 try:
                     # Read message length header (4 bytes, big-endian)
-                    len_bytes = client_socket.recv(4)
-                    if not len_bytes:
-                        print("🔌 Client disconnected")
-                        break
-                    msg_length = int.from_bytes(len_bytes, 'big')
+                    request_started = time.perf_counter()
+                    len_bytes = _recv_exact(client_socket, 4)
+                    msg_length = int.from_bytes(len_bytes, "big")
+                    _log(f"request receive start header_bytes={msg_length}")
+                    header_payload = _recv_exact(client_socket, msg_length)
+                    header_receive_s = time.perf_counter() - request_started
 
-                    # Read the full message based on length
-                    chunks = []
-                    remaining = msg_length
-                    while remaining > 0:
-                        chunk = client_socket.recv(min(remaining, 4096))
-                        if not chunk:
-                            raise ConnectionError("Incomplete data received")
-                        chunks.append(chunk)
-                        remaining -= len(chunk)
-                    raw_msg = b''.join(chunks).decode('utf-8')
-
-                    # Deserialize JSON to Python, reconstruct any numpy arrays
-                    data = json_to_numpy(raw_msg)
+                    header_started = time.perf_counter()
+                    header = json.loads(header_payload.decode("utf-8"))
+                    header_s = time.perf_counter() - header_started
+                    if (
+                        isinstance(header, dict)
+                        and header.get(_COMPRESSED_PAYLOAD_MARKER) is True
+                    ):
+                        compressed_length = int.from_bytes(
+                            _recv_exact(client_socket, 4), "big"
+                        )
+                        payload_receive_started = time.perf_counter()
+                        compressed = _recv_exact(client_socket, compressed_length)
+                        payload_receive_s = time.perf_counter() - payload_receive_started
+                        decompress_started = time.perf_counter()
+                        raw_msg = zlib.decompress(compressed).decode("utf-8")
+                        decompress_s = time.perf_counter() - decompress_started
+                        parse_started = time.perf_counter()
+                        data = json_to_numpy(raw_msg)
+                        parse_s = time.perf_counter() - parse_started
+                        _log(
+                            f"request compressed_bytes={compressed_length} "
+                            f"raw_bytes={len(raw_msg)} header_receive_s={header_receive_s:.3f} "
+                            f"header_s={header_s:.3f} payload_receive_s={payload_receive_s:.3f} "
+                            f"decompress_s={decompress_s:.3f} parse_s={parse_s:.3f}"
+                        )
+                    else:
+                        parse_started = time.perf_counter()
+                        data = json_to_numpy(header_payload.decode("utf-8"))
+                        parse_s = time.perf_counter() - parse_started
+                        _log(
+                            f"request uncompressed_bytes={msg_length} "
+                            f"receive_s={header_receive_s:.3f} parse_s={parse_s:.3f}"
+                        )
+                    receive_s = header_receive_s + (
+                        payload_receive_s
+                        if isinstance(header, dict)
+                        and header.get(_COMPRESSED_PAYLOAD_MARKER) is True
+                        else 0.0
+                    )
+                    deserialize_s = time.perf_counter() - header_started - (
+                        payload_receive_s
+                        if isinstance(header, dict)
+                        and header.get(_COMPRESSED_PAYLOAD_MARKER) is True
+                        else 0.0
+                    )
 
                     # Extract command and observation
                     cmd = data.get("cmd")
@@ -158,21 +216,34 @@ class ModelServer:
                     if not callable(method):
                         raise AttributeError(f"No model method named '{cmd}'")
 
-                    # Call method with or without obs
+                    _log(
+                        f"request dispatch cmd={cmd!r} receive_s={receive_s:.3f} "
+                        f"deserialize_s={deserialize_s:.3f}"
+                    )
+                    method_started = time.perf_counter()
                     result = method(obs) if obs is not None else method()
+                    method_s = time.perf_counter() - method_started
                     response = {"res": result}
 
-                    # Serialize response and send back with length header
-                    resp_bytes = numpy_to_json(response).encode('utf-8')
-                    client_socket.sendall(len(resp_bytes).to_bytes(4, 'big'))
+                    serialize_started = time.perf_counter()
+                    resp_bytes = numpy_to_json(response).encode("utf-8")
+                    serialize_s = time.perf_counter() - serialize_started
+                    send_started = time.perf_counter()
+                    client_socket.sendall(len(resp_bytes).to_bytes(4, "big"))
                     client_socket.sendall(resp_bytes)
+                    send_s = time.perf_counter() - send_started
+                    _log(
+                        f"request complete cmd={cmd!r} response_bytes={len(resp_bytes)} "
+                        f"method_s={method_s:.3f} serialize_s={serialize_s:.3f} "
+                        f"send_s={send_s:.3f} total_s={time.perf_counter() - request_started:.3f}"
+                    )
 
                 except (ConnectionResetError, BrokenPipeError):
-                    print("🔌 Client connection lost")
+                    _log("Client connection lost")
                     break
                 except Exception as e:
                     err = f"Error handling request: {e}"
-                    print(f"⚠️ {err}")
+                    _log(err)
                     tb = traceback.format_exc()
                     error_resp = numpy_to_json({"error": err, "traceback": tb}).encode('utf-8')
                     client_socket.sendall(len(error_resp).to_bytes(4, 'big'))

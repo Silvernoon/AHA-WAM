@@ -30,6 +30,12 @@ from ahawam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_jso
 logger = logging.getLogger(__name__)
 
 
+def _sync_cuda(device: torch.device | str) -> None:
+    resolved = torch.device(device)
+    if resolved.type == "cuda":
+        torch.cuda.synchronize(resolved)
+
+
 def _is_none_like(value: Any) -> bool:
     if value is None:
         return True
@@ -462,6 +468,7 @@ class WorldActionRobotWinPolicy:
         return denorm.numpy()
 
     def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
+        started = time.perf_counter()
         obs_data = observation["observation"]
         if self.num_views == 1:
             head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
@@ -491,7 +498,11 @@ class WorldActionRobotWinPolicy:
                 axis=0,
             )
             image_tensor = torch.from_numpy(views).permute(0, 3, 1, 2)
-
+        logger.info(
+            "predict stage=image_cpu shape=%s elapsed_s=%.3f",
+            tuple(image_tensor.shape),
+            time.perf_counter() - started,
+        )
         image_tensor = image_tensor.to(
             device=self.model.device,
             dtype=self.model.torch_dtype,
@@ -500,25 +511,60 @@ class WorldActionRobotWinPolicy:
         return image_tensor
 
     def _predict_next_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
+        request_started = time.perf_counter()
         image_tensor = self._build_robotwin_image_tensor(observation)
+        _sync_cuda(self.model.device)
+        logger.info(
+            "predict stage=image_device elapsed_s=%.3f",
+            time.perf_counter() - request_started,
+        )
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
+        normalize_started = time.perf_counter()
         proprio = self._normalize_state(state_vector)
+        logger.info(
+            "predict stage=normalize_state elapsed_s=%.3f",
+            time.perf_counter() - normalize_started,
+        )
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             if not self._episode_prefilled:
+                prefill_started = time.perf_counter()
+                logger.info("predict stage=video_prefill start")
                 self._prefill_episode(prompt=prompt, image_tensor=image_tensor)
+                _sync_cuda(self.model.device)
+                logger.info(
+                    "predict stage=video_prefill complete elapsed_s=%.3f",
+                    time.perf_counter() - prefill_started,
+                )
+            action_started = time.perf_counter()
+            logger.info("predict stage=action_chunk start")
             pred = self._infer_action_chunk(
                 image_tensor=image_tensor,
                 proprio=proprio,
+            )
+            _sync_cuda(self.model.device)
+            logger.info(
+                "predict stage=action_chunk complete elapsed_s=%.3f",
+                time.perf_counter() - action_started,
             )
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
             self._timing_rollout["infer_calls"] += 1.0
 
+        denormalize_started = time.perf_counter()
         action_tensor = pred["action_chunk"].unsqueeze(0)
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
+        logger.info(
+            "predict stage=denormalize complete elapsed_s=%.3f total_s=%.3f "
+            "finite=%s range=[%.4f,%.4f]",
+            time.perf_counter() - denormalize_started,
+            time.perf_counter() - request_started,
+            bool(np.isfinite(action_chunk).all()),
+            float(np.nanmin(action_chunk)),
+            float(np.nanmax(action_chunk)),
+        )
         return action_chunk
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:

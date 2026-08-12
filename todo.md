@@ -54,6 +54,8 @@ shared=True, views=3, history=6, horizon=80, offset=15, chunk=16
 - 新 4090 渲染机 `connect.bjb3.seetacloud.com:49223` 已验证：RTX 4090、Driver `580.142`、密钥 SSH 和 `my_nvidia_icd.json` 下 SAPIEN 正常。
 - 重新闭环时确认 RoboTwin 默认仍把每个 50 FPS qpos 当作独立 TOPP 终点；单回合超过一小时仍未完成，不能作为有效控制实验。已增加可选 `ROBOTWIN_QPOS_CONTROL_MODE=fixed_rate`，用 5 个 250 Hz physics step 对应一个 50 Hz 数据动作。
 - 但 16 步 Teacher 首个远程 action 请求仍出现分钟级无 GPU 利用率的等待；将 timeout 从 180 秒提高到 900 秒后仍未形成完整结果。因此当前还有模型服务请求阻塞/推理延迟问题，不能声称已经完成修正后的闭环复测。
+- 分阶段日志已定位旧“Teacher 推理卡住”为网络传输问题：每个三相机 observation 经 base64 JSON 后约 `1.232 MB`，通过双层 SSH 转发接收耗时 `85–152 s`；真实首个 Teacher method 只需 `1.013 s`，后续 deque 命中为 `0.000 s`。GPU 低利用率是服务端在等请求字节，不是 16 步扩散卡死。
+- zlib level-1 将请求压到约 `207–308 KB`，客户端编码约 `0.018–0.021 s`，首个请求总耗时降至 `46.565 s`，后续降至约 `15–40 s`。当前链路仍受双层 SSH 的高延迟/吞吐影响，下一步应取消本地中继，改为渲染机到 A800 的单跳 TCP/SSH，或换二进制图像协议。
 
 ## 优先排查项
 
